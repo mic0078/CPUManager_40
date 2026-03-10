@@ -6772,9 +6772,17 @@ $Script:Timer.Add_Tick({
         }
         if (-not $Script:LastWatchdogIteration) { $Script:LastWatchdogIteration = 0 }
         if (-not $Script:WatchdogStuckCounter) { $Script:WatchdogStuckCounter = 0 }
+        if (-not $Script:PostHealGraceTicks) { $Script:PostHealGraceTicks = 0 }
         $currentIter = $Script:LastIteration
         if ($currentIter -eq $Script:LastWatchdogIteration) {
-            $Script:WatchdogStuckCounter++
+            # v43.15: Post-heal grace period — don't flood SELF-HEAL after recovery
+            if ($Script:PostHealGraceTicks -gt 0) {
+                $Script:PostHealGraceTicks--
+                # Keep LastWatchdogIteration synced during grace so counter resets cleanly
+                $Script:LastWatchdogIteration = $currentIter
+            } else {
+                $Script:WatchdogStuckCounter++
+            }
             if ($Script:WatchdogStuckCounter -ge 30) {  # 30 ticks = ~30s
                 # Dane zamrozone - zresetuj cache lock i sprobuj zrestartowac timery
                 $Script:WatchdogStuckCounter = 0
@@ -6796,7 +6804,8 @@ $Script:Timer.Add_Tick({
                         $Script:CachedWidgetData = $fileCheck
                         $Script:LastIteration = $fileCheck.Iteration
                         $Script:LastValidData = $fileCheck
-                        $Script:LastWatchdogIteration = $fileCheck.Iteration  # FIX: prevent re-trigger on same iter
+                        $Script:LastWatchdogIteration = $fileCheck.Iteration
+                        $Script:PostHealGraceTicks = 60  # v43.15: 60s grace before watchdog can re-fire
                         Add-Content -Path "$Script:ConfigDir\ErrorLog.txt" -Value "[SELF-HEAL] ✓ Recovered data from file (iter: $($fileCheck.Iteration), was: $currentIter)" -Encoding UTF8 -ErrorAction SilentlyContinue
                     }
                     # Restart timerów
@@ -6809,6 +6818,7 @@ $Script:Timer.Add_Tick({
             }
         } else {
             $Script:WatchdogStuckCounter = 0
+            $Script:PostHealGraceTicks = 0  # v43.15: clear grace on genuine progress
             $Script:LastWatchdogIteration = $currentIter
         }
         } # V38 FIX: End of if ($hasValidData) block

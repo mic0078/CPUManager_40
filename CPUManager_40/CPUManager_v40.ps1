@@ -729,6 +729,15 @@ public static class Win32 {
     public static extern int NtSuspendProcess(IntPtr processHandle);
     [DllImport("ntdll.dll", SetLastError = true)]
     public static extern int NtResumeProcess(IntPtr processHandle);
+    // SetProcessWorkingSetSizeEx — HARD_MIN enforcement (nie tylko hint!)
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetProcessWorkingSetSizeEx(
+        IntPtr hProcess, IntPtr dwMinimumWorkingSetSize,
+        IntPtr dwMaximumWorkingSetSize, uint Flags);
+    public const uint QUOTA_LIMITS_HARDWS_MIN_ENABLE  = 0x00000001;
+    public const uint QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x00000002;
+    public const uint QUOTA_LIMITS_HARDWS_MAX_ENABLE  = 0x00000004;
+    public const uint QUOTA_LIMITS_HARDWS_MAX_DISABLE = 0x00000008;
 }
 public static class ConsoleWindow {
     [DllImport("kernel32.dll")]
@@ -782,6 +791,15 @@ public static class IntelPowerAPI {
 }
 '@
 Add-Type -Language CSharp -TypeDefinition $win32SignatureEarly -ErrorAction Stop
+}
+# Helper function: SetProcessWorkingSetSizeEx z HARD_MIN flag
+# Zdefiniowana po Add-Type — [Win32] dostępny w runtime, nie może być wewnątrz klasy (parse-time)
+function Set-HardMinWorkingSet {
+    param([IntPtr]$Handle, [long]$MinWS, [long]$MaxWS)
+    try {
+        # QUOTA_LIMITS_HARDWS_MIN_ENABLE = 0x1
+        return [Win32]::SetProcessWorkingSetSizeEx($Handle, [IntPtr]$MinWS, [IntPtr]$MaxWS, [uint32]1)
+    } catch { return $false }
 }
 # ═══════════════════════════════════════════════════════════════════════════════
 # CACHE RELOCATOR - Cache Relocator zintegrowany z ENGINE
@@ -2175,6 +2193,27 @@ try {
     [Console]::InputEncoding = [System.Text.Encoding]::UTF8
     $OutputEncoding = [System.Text.Encoding]::UTF8
 } catch { }
+# Funkcja odbudowy cache ikon Windows
+function Rebuild-IconCache {
+    try {
+        Write-Log "Rozpoczynam odbudowę cache ikon Windows..." "INFO"
+        $explorer = Get-Process explorer -ErrorAction SilentlyContinue
+        if ($explorer) {
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+        $userProfile = [Environment]::GetFolderPath("UserProfile")
+        $iconCacheFiles = @("IconCache.db", "IconCache_*.db", "ThumbCache_*.db")
+        foreach ($pattern in $iconCacheFiles) {
+            Get-ChildItem -Path "$userProfile\AppData\Local" -Filter $pattern -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 1
+        Start-Process explorer.exe
+        Write-Log "Odbudowa cache ikon zakończona." "INFO"
+    } catch {
+        Write-Log "Błąd podczas odbudowy cache ikon: $_" "ERROR"
+    }
+}
 # CLEANUP SIGNAL FILES ON STARTUP - CRITICAL!
 # Usun stare pliki sygnalowe ktore mogly zostac po poprzedniej sesji
 $signalDir = $Script:ConfigDir
@@ -2185,6 +2224,8 @@ $signalFiles = @(
     "$signalDir\Widget.pid"
 )
 Remove-FilesIfExist $signalFiles
+# Odbuduj cache ikon Windows na starcie
+Rebuild-IconCache
 # Reset WidgetData.json to default values on startup
 # NOTE: Avoid unconditional overwrite -- only create defaults when file is missing or empty.
 $widgetDataPath = Join-Path $signalDir 'WidgetData.json'
@@ -12810,6 +12851,37 @@ class AICoordinator {
             $finalScore = 45  # Minimum Balanced gdy CPU aktywny
         }
         
+        # EXPLORER SPIKE GUARD: jeśli foreground=Desktop/Explorer a CPU>30%
+        # to prawdopodobnie Explorer odświeża ikony/thumbnails — to nie jest
+        # "prawdziwa" aktywność użytkownika, nie wchodź w Turbo/Balanced
+        # Sprawdź ile CPU żre sam explorer.exe (nie systemowy spike)
+        $explorerCPU = 0
+        try {
+            $explorerProcs = Get-Process -Name explorer -ErrorAction SilentlyContinue
+            if ($explorerProcs) {
+                $explorerCPU = ($explorerProcs | Measure-Object CPU -Sum).Sum
+                # CPU z Get-Process to sekundy użycia — przelicz na % (przybliżenie)
+                # Jeśli Explorer ma dużo CPU a foreground=Desktop → to odświeżanie ikon
+            }
+        } catch {}
+        if (($foregroundApp -eq 'Desktop' -or $foregroundApp -eq 'explorer') -and $cpu -gt 30) {
+            # Sprawdź czy to Explorer dominuje CPU (>50% systemu idzie na explorer)
+            # Jeśli tak — ignoruj ten spike, nie podnoś trybu
+            $explorerDominant = $false
+            try {
+                $expProc = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($expProc) {
+                    $explorerPct = [Math]::Round(($expProc.CPU / ([Environment]::ProcessorCount * 1.0)) * 2, 1)
+                    if ($explorerPct -gt 15) { $explorerDominant = $true }
+                }
+            } catch {}
+            if ($explorerDominant) {
+                # Explorer odświeża ikony — zbij score do Silent/Balanced bez Turbo
+                $finalScore = [Math]::Min($finalScore, 54)
+                Write-RCLog "EXPLORER SPIKE: score capped (explorer refreshing icons, CPU=$cpu%)"
+            }
+        }
+        
         # Konwersja score → tryb z HYSTERESIS
         # v43.14: Progi adaptowane do CPUAgressiveness
         # aggressive=łatwiej Turbo (niższy próg), conservative=łatwiej Silent
@@ -15902,6 +15974,11 @@ class AppRAMCache {
     # ── #4 Startup Time Learning ──
     [hashtable] $AppStartupMs    # appName → mediana czasu startu w ms (lista próbek)
     [datetime]  $LaunchRaceStart # Kiedy wyścig wystartował (mierzy czas startu)
+
+    # ── v43.15: AI Engine feedback ──
+    [double] $LastAIScore        # Ostatni score silnika AI (0-100); wysoki = heavy load
+    [string] $LastAIMode         # Ostatni tryb AI: Turbo/Balanced/Silent
+    [string] $LastAIContext      # Ostatni kontekst: Gaming/Work/Music/Browsing/Mixed/Idle
     
     AppRAMCache() {
         $this.CachedApps = @{}
@@ -16073,15 +16150,33 @@ class AppRAMCache {
         # #10: Cost efficiency bonus
         $efficiency = $this.GetCostEfficiency($appName, $prophetApps)
         $basePriority += [Math]::Min(10, $efficiency * 0.5)
+
+        # v43.15: Context-aware bonus — silnik AI wie czym zajmuje się teraz user
+        # Gaming → boost gier; Work → boost IDE/przeglądarki; Music → boost DAW/audio
+        if (-not [string]::IsNullOrWhiteSpace($this.LastAIContext)) {
+            $appLower = $appName.ToLower()
+            $isGameContext  = $this.LastAIContext -match 'Gaming|Game'
+            $isWorkContext  = $this.LastAIContext -match 'Work|IDE|Code|Office'
+            $isMusicContext = $this.LastAIContext -match 'Music|Audio|DAW'
+            $isBrowse       = $this.LastAIContext -match 'Browsing|Browse'
+
+            $contextBonus = 0
+            if ($isGameContext  -and ($appLower -match 'soma|game|steam|epic|galax|gog|unity|unreal|godot|hl2|csgo')) { $contextBonus = 20 }
+            if ($isWorkContext  -and ($appLower -match 'code|idea|rider|visual|chrome|firefox|edge|word|excel|teams|slack|notion')) { $contextBonus = 18 }
+            if ($isMusicContext -and ($appLower -match 'ableton|fl.studio|reaper|audacity|vocoder|asio|vst|cubase|studio.one|reason')) { $contextBonus = 18 }
+            if ($isBrowse      -and ($appLower -match 'chrome|firefox|edge|opera|brave')) { $contextBonus = 12 }
+            $basePriority += $contextBonus
+        }
         
         # Cache hits + time decay
         if ($this.CachedApps.ContainsKey($appName)) {
             $entry = $this.CachedApps[$appName]
             $basePriority += [Math]::Min(25, $entry.HitCount * 5)
             
-            # #6: Heavy = wolniejszy decay (halfLife 20 min), Light = szybszy (8 min)
+            # #6: Heavy = wolniejszy decay (halfLife 50 min), Light = szybszy (8 min)
+            # Heavy apps (gry, DAW, heavy software) zostają w cache przez ~50 min bez dostępu
             $appClass = $this.ClassifyApp($appName, $prophetApps)
-            $halfLife = if ($appClass -eq "Heavy") { 20.0 } else { 8.0 }
+            $halfLife = if ($appClass -eq "Heavy") { 50.0 } else { 8.0 }
             
             $minutesSinceAccess = ([datetime]::Now - $entry.LastAccess).TotalMinutes
             $decayFactor = [Math]::Pow(0.5, $minutesSinceAccess / $halfLife)
@@ -16266,11 +16361,72 @@ class AppRAMCache {
         }
         
         if ([string]::IsNullOrWhiteSpace($targetPath)) {
-            if (-not $this.NoPathCache.Contains($appName)) {
-                Write-RCLog "PRELOAD SKIP '$appName': no valid path (exePath='$exePath', inAppPaths=$($this.AppPaths.ContainsKey($appName)))"
-                $this.NoPathCache.Add($appName) | Out-Null
+            # v43.15: jeśli mamy LearnedFiles — preloaduj je bezpośrednio bez exe
+            # (exe mógł zmienić lokalizację po update, ale DLL-e/moduły są nadal ważne)
+            $hasLearned = ($this.AppPaths.ContainsKey($appName) -and
+                           $this.AppPaths[$appName].LearnedFiles -and
+                           $this.AppPaths[$appName].LearnedFiles.Count -ge 2)
+            if (-not $hasLearned) {
+                if (-not $this.NoPathCache.Contains($appName)) {
+                    Write-RCLog "PRELOAD SKIP '$appName': no valid path (exePath='$exePath', inAppPaths=$($this.AppPaths.ContainsKey($appName)))"
+                    $this.NoPathCache.Add($appName) | Out-Null
+                }
+                return $false
             }
-            return $false
+            # Mamy learned files — załaduj je (tryb LEARNED-ONLY, bez exe)
+            $lf = $this.AppPaths[$appName].LearnedFiles
+            $maxModPerApp = 50
+            if ($this.HW -and $this.HW.CacheStrategy) { $maxModPerApp = $this.HW.CacheStrategy.MaxModules }
+            else {
+                $totalGB2b = $this.TotalSystemRAM / 1024.0
+                $maxModPerApp = if ($totalGB2b -ge 32) { 30 } elseif ($totalGB2b -ge 16) { 20 } else { 12 }
+            }
+            $filesToLoadLO = [System.Collections.Generic.List[hashtable]]::new()
+            $countLO = 0
+            foreach ($f in $lf) {
+                if ($countLO -ge $maxModPerApp) { break }
+                if ([string]::IsNullOrWhiteSpace($f.Path) -or -not (Test-Path $f.Path -ErrorAction SilentlyContinue)) { continue }
+                $budgetLeft = ($this.MaxCacheMB - $this.TotalCachedMB) * 1MB
+                $currentBatchSz = 0; foreach ($bf in $filesToLoadLO) { $currentBatchSz += $bf.Size }
+                if (($currentBatchSz + $f.Size) -gt $budgetLeft) { break }
+                $filesToLoadLO.Add(@{ Path = $f.Path; Size = $f.Size; Type = "learned" })
+                $countLO++
+            }
+            if ($filesToLoadLO.Count -eq 0) {
+                if (-not $this.NoPathCache.Contains($appName)) {
+                    Write-RCLog "PRELOAD SKIP '$appName': no valid path and all LearnedFiles missing from disk"
+                    $this.NoPathCache.Add($appName) | Out-Null
+                }
+                return $false
+            }
+            $totalSizeLO = 0; foreach ($f in $filesToLoadLO) { $totalSizeLO += $f.Size }
+            $sizeMBLO = [Math]::Round($totalSizeLO / 1MB, 1)
+            $this.CachedApps[$appName] = @{
+                Files = [System.Collections.Generic.List[object]]::new()
+                SizeMB = $sizeMBLO
+                CachedAt = [datetime]::Now
+                LastAccess = [datetime]::Now
+                HitCount = 0
+                FileCount = $filesToLoadLO.Count
+                PreloadLevel = $preloadLevel
+                LoadComplete = $false
+                FilesLoaded = 0
+            }
+            $this.TotalCachedMB += $sizeMBLO
+            $this.TotalPreloads++
+            $this.RecordPreloadAttempt($appName)
+            Write-RCLog "PRELOAD '$appName' [$preloadLevel/LEARNED-ONLY]: $($filesToLoadLO.Count) files ($sizeMBLO MB) conf=$([Math]::Round($confidence,2)) [exe path stale/missing]"
+            foreach ($fileInfo in $filesToLoadLO) {
+                $this.BatchQueue.Enqueue(@{
+                    AppName = $appName
+                    Path = $fileInfo.Path
+                    Size = $fileInfo.Size
+                    Type = $fileInfo.Type
+                    LargeFile = ($fileInfo.Size -ge 200MB)
+                    TouchedOffset = [long]0
+                })
+            }
+            return $true
         }
         
         $appDir = [System.IO.Path]::GetDirectoryName($targetPath)
@@ -16891,6 +17047,9 @@ class AppRAMCache {
         if ($this.TotalCachedMB -ge $this.MaxCacheMB * 0.8) { return }
         if ($this.MemoryPressure -gt 0.5) { return }
         
+        # v43.15: AI Score wysoki → system zajęty, nie preloaduj w tle (oszczędź I/O)
+        if ($this.LastAIScore -ge 70) { return }
+        
         # #4: Battery/thermal/mode awareness
         if ($onBattery) { return }                         # Na baterii → nie preloaduj w idle
         if ($cpuTemp -gt 70) { return }                    # CPU gorący → pauza
@@ -16981,7 +17140,41 @@ class AppRAMCache {
     # AI TICK — główna pętla eviction/pressure
     # ═══════════════════════════════════════════════════════════════
     [void] AITick([hashtable]$prophetApps, [hashtable]$transitions) {
+        $this.AITick($prophetApps, $transitions, $this.LastAIScore, $this.LastAIMode, $this.LastAIContext)
+    }
+
+    [void] AITick([hashtable]$prophetApps, [hashtable]$transitions, [double]$aiScore, [string]$aiMode, [string]$aiContext) {
         if (-not $this.Enabled) { return }
+
+        # v43.15: Zapisz feedback od silników AI (widoczny we wszystkich metodach)
+        if ($aiScore -gt 0) { $this.LastAIScore = $aiScore }
+        if (-not [string]::IsNullOrWhiteSpace($aiMode))    { $this.LastAIMode = $aiMode }
+        if (-not [string]::IsNullOrWhiteSpace($aiContext)) { $this.LastAIContext = $aiContext }
+
+        # v43.15: Gdy AI Score wysoki (Turbo / heavy load) → natychmiast chroń foreground app WS
+        # AI wie że system jest pod obciążeniem — nie czekaj co 30s na ReassertProtectedWorkingSets
+        if ($aiScore -ge 75 -and $this.HeavyMode -and -not [string]::IsNullOrWhiteSpace($this.HeavyModeApp)) {
+            # Ustaw BatchSize na minimum — nie marnuj I/O czasu procesora na ładowanie w tle
+            $this.BatchSizeBytes = $this.BatchSizeMin
+        } elseif ($aiScore -lt 30 -and $this.BatchSizeBytes -lt $this.BatchSizeMax) {
+            # Niskie obciążenie → wróć do agresywnego preload
+            $this.BatchSizeBytes = [Math]::Min($this.BatchSizeMax, $this.BatchSizeBytes + 2MB)
+        }
+
+        # v43.15: Turbo = blokada eviction (nie wyrzucaj cache gdy CPU/GPU pod pełnym obciążeniem)
+        if ($aiMode -eq "Turbo" -and $this.HeavyMode) {
+            # Tylko BatchTick + WS re-assert — pomiń całą resztę (eviction, resize, itp.)
+            $this.BatchTick() | Out-Null
+            if (-not $this.PSObject.Properties['_LastReassertTime']) {
+                $this | Add-Member -NotePropertyName '_LastReassertTime' -NotePropertyValue ([datetime]::MinValue) -Force
+            }
+            if (([datetime]::Now - $this._LastReassertTime).TotalSeconds -ge 15) {
+                $this._LastReassertTime = [datetime]::Now
+                $this.ReassertProtectedWorkingSets()
+            }
+            return
+        }
+
         $now = [datetime]::Now
         if (($now - $this.LastEvictionCheck).TotalSeconds -lt 15) { return }
         $this.LastEvictionCheck = $now
@@ -17033,6 +17226,15 @@ class AppRAMCache {
         
         # #2: Cleanup dead protected apps
         $this.CleanupProtectedApps()
+        
+        # RE-ASSERT WorkingSet co ~30s — Windows trim'uje WS nawet przy MinWorkingSet ustawionym
+        if (-not $this.PSObject.Properties['_LastReassertTime']) {
+            $this | Add-Member -NotePropertyName '_LastReassertTime' -NotePropertyValue ([datetime]::MinValue) -Force
+        }
+        if (([datetime]::Now - $this._LastReassertTime).TotalSeconds -ge 30) {
+            $this._LastReassertTime = [datetime]::Now
+            $this.ReassertProtectedWorkingSets()
+        }
         
         # RETOUCH: zapobiega WS trim — cache widoczny jako "In Use" nie "Available"
         $this.RetouchCachedPages()
@@ -17345,6 +17547,17 @@ class AppRAMCache {
         foreach ($displayName in $this.NameMap.Keys) {
             if ($this.NameMap[$displayName] -eq $name) { return $name }
         }
+        # Case-insensitive fallback — np. Thunderbird vs thunderbird
+        $nameLower = $name.ToLower()
+        foreach ($key in $this.CachedApps.Keys) {
+            if ($key.ToLower() -eq $nameLower) { return $key }
+        }
+        foreach ($key in $this.AppPaths.Keys) {
+            if ($key.ToLower() -eq $nameLower) { return $key }
+        }
+        foreach ($displayName in $this.NameMap.Keys) {
+            if ($this.NameMap[$displayName].ToLower() -eq $nameLower) { return $this.NameMap[$displayName] }
+        }
         return $name  # Zwróć jak jest
     }
     
@@ -17373,6 +17586,16 @@ class AppRAMCache {
             # Heavy: IsHeavy flag OR avgCPU>50% z >20 samples
             if ($isHeavy -or ($avgCPU -gt 50 -and $samples -gt 20)) { $class = "Heavy" }
         }
+        # v43.15: LearnedFiles size jako sygnał Heavy (app z >80MB modułów = ciężka)
+        # Ważne: działa nawet gdy Prophet nie ma jeszcze danych (nowa instalacja)
+        if ($class -eq "Light" -and $this.AppPaths.ContainsKey($appName)) {
+            $lf = $this.AppPaths[$appName].LearnedFiles
+            if ($lf -and $lf.Count -gt 0) {
+                $lfSizeMB = 0; foreach ($f in $lf) { $lfSizeMB += $f.Size }
+                $lfSizeMB = $lfSizeMB / 1MB
+                if ($lfSizeMB -gt 80) { $class = "Heavy" }  # >80MB modułów = Heavy
+            }
+        }
         # Runtime check: czy process ma duży working set?
         try {
             $proc = Get-Process -Name $appName -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -17389,9 +17612,35 @@ class AppRAMCache {
         try {
             $procs = Get-Process -Name $appName -ErrorAction SilentlyContinue
             if (-not $procs) { return }
-            foreach ($proc in $procs) {
+            
+            # Zbierz procesy do ochrony: główny + potomne (VST bridge, plugin hosts)
+            $procsToProtect = [System.Collections.Generic.List[object]]::new()
+            foreach ($p in $procs) { $procsToProtect.Add($p) }
+            
+            $childPluginNames = @('vstbridge','vsthost','jbridge','audiogridder',
+                'pluginval','vst3scanner','vstscanner','bridgeserver','clap-bridge',
+                'reaper_host','reaper_vst','bitwig-engine','bitwig-bridge',
+                'audiopluginhost','pluginhost','sforzando','xlnaudio')
+            try {
+                $mainPids = $procs | Select-Object -ExpandProperty Id
+                $allProcs = Get-Process -ErrorAction SilentlyContinue
+                foreach ($cp in $allProcs) {
+                    $isChild = $false
+                    try {
+                        $wmiP = Get-CimInstance Win32_Process -Filter "ProcessId=$($cp.Id)" -ErrorAction SilentlyContinue
+                        if ($wmiP -and $mainPids -contains $wmiP.ParentProcessId) { $isChild = $true }
+                    } catch {}
+                    if (-not $isChild) {
+                        $cpn = $cp.ProcessName.ToLower()
+                        foreach ($ph in $childPluginNames) { if ($cpn -like "*$ph*") { $isChild = $true; break } }
+                    }
+                    if ($isChild) { $procsToProtect.Add($cp) }
+                }
+            } catch {}
+            
+            foreach ($proc in $procsToProtect) {
                 $ws = $proc.WorkingSet64
-                if ($ws -lt 100MB) { continue }  # Nie chronimy małych
+                if ($ws -lt 50MB) { continue }  # Nie chronimy bardzo małych
                 $key = "$appName`:$($proc.Id)"
                 if ($this.ProtectedApps.ContainsKey($key)) {
                     # Update stable WS (slow moving average)
@@ -17400,19 +17649,50 @@ class AppRAMCache {
                 } else {
                     $this.ProtectedApps[$key] = @{
                         PID = $proc.Id
-                        AppName = $appName
+                        AppName = "$appName[$($proc.ProcessName)]"
                         MinWS = $ws
                         StableWS = $ws
                         ProtectedAt = [datetime]::Now
                     }
                 }
-                # Set min working set na procesu (hint dla OS)
+                # SetProcessWorkingSetSizeEx z flagą HARD_MIN — wymusza min WS w RAM (nie tylko hint!)
                 try {
-                    $minWS = [Math]::Max(50MB, [long]($ws * 0.7))
-                    $proc.MinWorkingSet = [IntPtr]$minWS
-                } catch {}
+                    $minWS = [Math]::Max(50MB, [long]($ws * 0.70))  # 70% WS jako twardy min
+                    $maxWS = [Math]::Max($minWS + 128MB, [long]($ws * 1.30))  # Max = 130% WS
+                    $ok = Set-HardMinWorkingSet -Handle $proc.Handle -MinWS $minWS -MaxWS $maxWS
+                    if (-not $ok) {
+                        # Fallback do miękkiego hintu gdy brak uprawnień
+                        $proc.MinWorkingSet = [IntPtr]$minWS
+                    }
+                } catch {
+                    try { $proc.MinWorkingSet = [IntPtr]([Math]::Max(50MB, [long]($ws * 0.7))) } catch {}
+                }
             }
         } catch {}
+    }
+
+    # Re-assertuje MinWS na chronionych procesach (wywołuj co ~30s z głównej pętli)
+    # Windows regularnie trim'uje WS nawet przy ustawionym MinWorkingSet — to kontruje ten efekt
+    [void] ReassertProtectedWorkingSets() {
+        foreach ($key in @($this.ProtectedApps.Keys)) {
+            $entry = $this.ProtectedApps[$key]
+            try {
+                $proc = Get-Process -Id $entry.PID -ErrorAction Stop
+                $currentWS = $proc.WorkingSet64
+                $minWS = [Math]::Max(50MB, [long]($entry.StableWS * 0.70))
+                $maxWS = [Math]::Max($minWS + 128MB, [long]($entry.StableWS * 1.30))
+                # Czy Windows już ztruncował WS poniżej naszego minimum?
+                if ($currentWS -lt $minWS) {
+                    $ok = Set-HardMinWorkingSet -Handle $proc.Handle -MinWS $minWS -MaxWS $maxWS
+                    if (-not $ok) { $proc.MinWorkingSet = [IntPtr]$minWS }
+                    Write-RCLog "REASSERT WS '$($entry.AppName)' PID=$($entry.PID): was=$([int]($currentWS/1MB))MB → min=$([int]($minWS/1MB))MB"
+                }
+                # Aktualizuj StableWS
+                $entry.StableWS = [long]($entry.StableWS * 0.9 + $currentWS * 0.1)
+            } catch {
+                $this.ProtectedApps.Remove($key)  # Proces zakończony
+            }
+        }
     }
     
     [void] CleanupProtectedApps() {
@@ -17506,11 +17786,23 @@ class AppRAMCache {
         # Jeśli stara app była chroniona → przedłuż ochronę
         if (-not [string]::IsNullOrWhiteSpace($oldApp)) {
             $this.AltTabProtection[$oldApp] = @{
-                ProtectedUntil = $now.AddMinutes(3)
+                ProtectedUntil = $now.AddMinutes(5)  # 5 min ochrona po opuszczeniu
                 SwitchedAt = $now
             }
             # Chroń working set starej app
             $this.ProtectWorkingSet($oldApp)
+        }
+        # AGRESYWNY PRELOAD gdy użytkownik WRACA do heavy app (AltTab powrót)
+        # Jeśli nowa app była chroniona AltTab — znaczy powracał z innej apki do tej
+        if (-not [string]::IsNullOrWhiteSpace($newApp)) {
+            $isReturn = $this.IsAltTabProtected($newApp)
+            if ($isReturn) {
+                # Natychmiastowy preload do PriorityQueue
+                $this.ElevateToPriority($newApp)
+                # Re-assert WS dla powracającej app
+                $this.ProtectWorkingSet($newApp)
+                Write-RCLog "ALTTAB RETURN '$newApp': elevated to PriorityQ + WS re-asserted"
+            }
         }
         # Czyść wygasłe ochrony
         foreach ($app in @($this.AltTabProtection.Keys)) {
@@ -17653,6 +17945,17 @@ class AppRAMCache {
     # ═══════════════════════════════════════════════════════════════
     
     # ═══════════════════════════════════════════════════════════════
+    # HELPER: sprawdź czy ścieżka exe to śmieć (temp instalator, VS Code extension, itp.)
+    # ═══════════════════════════════════════════════════════════════
+    hidden [bool] IsJunkExePath([string]$exePath) {
+        if ([string]::IsNullOrWhiteSpace($exePath)) { return $false }
+        return ($exePath -match '\\(Temp|TEMP|tmp)\\' -or
+                $exePath -match '\.tmp$' -or
+                $exePath -match '\\is-[A-Z0-9]+\.tmp\\' -or
+                $exePath -match '\\\.vscode\\extensions\\')
+    }
+
+    # ═══════════════════════════════════════════════════════════════
     # PROFILE APP MODULES — skanuj RZECZYWISTE moduły załadowane przez proces
     # Wywoływane gdy app jest running → zapamiętuje dokładne pliki
     # ═══════════════════════════════════════════════════════════════
@@ -17673,6 +17976,47 @@ class AppRAMCache {
                 $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue)
             } | Select-Object -First $maxModules
             
+            # CHILD PROCESS SCAN: wykryj procesy potomne (VST bridge, plugin hosts, itp.)
+            # Np. Ableton → vstbridge.exe, jBridge, VSTScanner, AudioGridder itp.
+            $childModules = [System.Collections.Generic.List[object]]::new()
+            try {
+                $allProcs = Get-Process -ErrorAction SilentlyContinue
+                $childPluginNames = @('vstbridge','vsthost','jbridge','audiogridder','wine','wineserver',
+                    'pluginval','vst3scanner','vstscanner','bridgeserver','clap-bridge','clap-host',
+                    'reaper_host','reaper_vst','bitwig-engine','bitwig-bridge','ableton-plugins',
+                    'audiopluginhost','pluginhost','fx-chain','sforzando','xlnaudio')
+
+                foreach ($cp in $allProcs) {
+                    # Czy to potomek głównego procesu (porównaj parent PID przez WMI)
+                    $isChild = $false
+                    try {
+                        $wmiProc = Get-CimInstance Win32_Process -Filter "ProcessId=$($cp.Id)" -ErrorAction SilentlyContinue
+                        if ($wmiProc -and $wmiProc.ParentProcessId -eq $proc.Id) { $isChild = $true }
+                    } catch {}
+                    # Lub czy nazwa procesu to znany plugin host
+                    if (-not $isChild) {
+                        $cpName = $cp.ProcessName.ToLower()
+                        foreach ($ph in $childPluginNames) { if ($cpName -like "*$ph*") { $isChild = $true; break } }
+                    }
+                    if ($isChild -and $cp.Id -ne $proc.Id) {
+                        try {
+                            $childMods = $cp.Modules | Where-Object { $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue) } | Select-Object -First 80
+                            foreach ($cm in $childMods) { $childModules.Add($cm) }
+                        } catch {}
+                    }
+                }
+                if ($childModules.Count -gt 0) {
+                    Write-RCLog "CHILD MODULES '$appName': found $($childModules.Count) modules from child/plugin processes"
+                }
+            } catch {}
+            
+            # Połącz moduły główne + potomne (bez duplikatów ścieżek)
+            $allModules = [System.Collections.Generic.List[object]]::new()
+            $seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($m in $modules) { if ($seenPaths.Add($m.FileName)) { $allModules.Add($m) } }
+            foreach ($m in $childModules) { if ($m.FileName -and $seenPaths.Add($m.FileName)) { $allModules.Add($m) } }
+            $modules = $allModules
+            
             if ($modules.Count -lt 2) { return }
             
             # Zbierz listę plików z rozmiarami
@@ -17691,6 +18035,12 @@ class AppRAMCache {
             }
             
             if ($learnedFiles.Count -lt 2) { return }
+            
+            # v43.15: odrzuć procesy z junk ścieżką (VS Code extension binaries, temp instalatory)
+            if ($this.IsJunkExePath($proc.Path)) {
+                Write-RCLog "PROFILE SKIP '$appName': junk exePath '$($proc.Path)'"
+                return
+            }
             
             # Zapisz do AppPaths
             if (-not $this.AppPaths.ContainsKey($appName)) {
@@ -17857,6 +18207,32 @@ class AppRAMCache {
             # CLEANUP: usuń entries z pustym ExePath (np. system processes bez ścieżki)
             $toRemove = @($this.AppPaths.Keys | Where-Object { -not $this.AppPaths[$_].ExePath })
             foreach ($key in $toRemove) { $this.AppPaths.Remove($key) }
+            
+            # v43.15 CLEANUP: wyczyść stale/junk ExePath (plik nie istnieje lub ścieżka to śmieć)
+            # Zostawiamy LearnedFiles — zostaną odkryte na nowo przy następnym uruchomieniu app
+            $stalePaths = @($this.AppPaths.Keys | Where-Object {
+                $ep = $this.AppPaths[$_].ExePath
+                if ([string]::IsNullOrWhiteSpace($ep)) { return $false }
+                # Junk: temp pliki (.tmp exe, instalatory Inno Setup, itp.)
+                $isJunk = ($ep -match '\\(Temp|TEMP|tmp)\\' -or
+                           $ep -match '\.tmp$' -or
+                           $ep -match '\\is-[A-Z0-9]+\.tmp\\' -or
+                           $ep -match '\\\.vscode\\extensions\\')
+                if ($isJunk) { return $true }
+                # Stale: ścieżka zapisana ale plik już nie istnieje
+                return (-not (Test-Path $ep -ErrorAction SilentlyContinue))
+            })
+            foreach ($key in $stalePaths) {
+                # Zachowaj LearnedFiles / statystyki, tylko wyczyść nieważną ścieżkę
+                if ($this.AppPaths[$key].LearnedFiles -and $this.AppPaths[$key].LearnedFiles.Count -gt 0) {
+                    $this.AppPaths[$key].ExePath = ""   # tryb "no-path" — Get-Process znajdzie nową ścieżkę
+                    $this.AppPaths[$key].Dir = ""
+                    Write-RCLog "STALE PATH cleared '$key': '$($this.AppPaths[$key].ExePath)' (LearnedFiles retained)"
+                } else {
+                    $this.AppPaths.Remove($key)
+                    Write-RCLog "STALE PATH removed '$key' (no LearnedFiles)"
+                }
+            }
             
             # NegativeScores (safe serialization)
             $negScores = @{}
@@ -18066,6 +18442,7 @@ class AppRAMCache {
                 $_.ProcessName -notmatch '^(svchost|csrss|lsass|services|smss|wininit|System|Idle|Registry|dwm|conhost|fontdrvhost|sihost|taskhostw|ctfmon|SearchHost|StartMenuExperienceHost|RuntimeBroker|TextInputHost|SecurityHealthSystray|explorer|ShellExperienceHost|pwsh|powershell|WindowsTerminal|WmiPrvSE|wmiprvse|ApplicationFrameHost|nvcontainer|NVDisplay\.Container|audiodg|CompPkgSrv|dllhost|ShellHost|igfxEM|dasHost|spoolsv|SearchIndexer|MidiSrv|IntelAudioService|CrossDeviceResume|TiWorker|msedgewebview2|GameManagerService3|OneApp\.IGCC\.WinService)$' -and
                 $_.ProcessName -notmatch '\.(tmp|nks\.tmp)$' -and
                 $_.Path -notmatch '\\(Temp|TEMP|tmp)\\' -and
+                $_.Path -notmatch '\\\.vscode\\extensions\\' -and  # v43.15: skip VS Code extension binaries
                 $_.WorkingSet64 -gt 30MB
             } | Sort-Object WorkingSet64 -Descending | Select-Object -First 20
             
@@ -18162,9 +18539,13 @@ class AppRAMCache {
             if ($this.NegativeScores.ContainsKey($appName)) {
                 $prio += [Math]::Min(20, $this.NegativeScores[$appName].HitCount * 3)
             }
-            # LEARNED bonus — app z profilem ładuje się efektywniej
-            if ($this.AppPaths[$appName].ContainsKey('LearnedFiles') -and $this.AppPaths[$appName].LearnedFiles -and $this.AppPaths[$appName].LearnedFiles.Count -gt 5) {
-                $prio += 10
+            # v43.15 LEARNED bonus — proporcjonalny do rozmiaru (większy profil = ważniejsza app)
+            if ($this.AppPaths[$appName].ContainsKey('LearnedFiles') -and $this.AppPaths[$appName].LearnedFiles -and $this.AppPaths[$appName].LearnedFiles.Count -gt 0) {
+                $lfSzMB = 0; foreach ($f in $this.AppPaths[$appName].LearnedFiles) { $lfSzMB += $f.Size }
+                $lfSzMB = $lfSzMB / 1MB
+                # 0-5MB → +2, 5-50MB → +8, 50-100MB → +15, >100MB → +20 (cap)
+                $learnedBonus = [Math]::Min(20, [int]($lfSzMB / 5))
+                $prio += [Math]::Max(2, $learnedBonus)
             }
             # Chain bonus
             if ($transitions) {
@@ -18286,6 +18667,148 @@ class AppRAMCache {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# NativeCopy — Win32 P/Invoke: FILE_FLAG_NO_BUFFERING + FILE_FLAG_WRITE_THROUGH
+# Omija Windows Cache Manager całkowicie — dane idą: dysk → RAM → dysk
+# Double-buffer producer-consumer: odczyt i zapis nakładają się w czasie
+# Wymaganie: bufory i offsety muszą być wielokrotnością 4096 (Advanced Format)
+# ═══════════════════════════════════════════════════════════════════════════
+if (-not ([System.Management.Automation.PSTypeName]'NativeCopy').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Concurrent;
+
+public static class NativeCopy {
+    const uint GR  = 0x80000000u;   // GENERIC_READ
+    const uint GW  = 0x40000000u;   // GENERIC_WRITE
+    const uint OE  = 3u;            // OPEN_EXISTING
+    const uint CA  = 2u;            // CREATE_ALWAYS
+    const uint SR  = 0x00000001u;   // FILE_SHARE_READ
+    const uint NB  = 0x20000000u;   // FILE_FLAG_NO_BUFFERING   — pomija OS read cache
+    const uint WT  = 0x80000000u;   // FILE_FLAG_WRITE_THROUGH  — zapis prosto na nośnik
+    const uint SS  = 0x08000000u;   // FILE_FLAG_SEQUENTIAL_SCAN — hint dla prefetcher
+    const int  SEC = 4096;          // Advanced Format / NVMe sector size
+
+    static readonly IntPtr INV = new IntPtr(-1);
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode, EntryPoint="CreateFileW")]
+    static extern IntPtr CF(string f, uint a, uint s, IntPtr sa, uint cr, uint fl, IntPtr t);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool ReadFile(IntPtr h, IntPtr b, uint n, out uint d, IntPtr o);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool WriteFile(IntPtr h, IntPtr b, uint n, out uint d, IntPtr o);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool GetFileSizeEx(IntPtr h, out long s);
+    [DllImport("kernel32.dll")] static extern bool SetFilePointerEx(IntPtr h, long d, out long np, uint m);
+    [DllImport("kernel32.dll")] static extern bool SetEndOfFile(IntPtr h);
+
+    // Kopiuje jeden plik: NO_BUFFERING+WRITE_THROUGH + double-buffer
+    // chunkMB: rozmiar bufora (zostanie wyrównany do 4096)
+    // prog:    prog[0] = skopiowane bajty (aktualizowane na żywo przez wątek zapisu)
+    // Zwraca "OK" lub opis błędu
+    public static string Copy(string src, string dst, int chunkMB, long[] prog) {
+        long chunk = Math.Max(SEC, (((long)chunkMB * 1024L * 1024L) / SEC) * SEC);
+
+        // Otwórz źródło: NO_BUFFERING+SEQUENTIAL_SCAN (pomiń read-cache OS)
+        IntPtr sH = CF(src, GR, SR, IntPtr.Zero, OE, NB|SS, IntPtr.Zero);
+        if (sH == INV) return "ERR_SRC:" + Marshal.GetLastWin32Error();
+        long fsz = 0; GetFileSizeEx(sH, out fsz);
+        long aln  = (fsz / SEC) * SEC;   // wyrównany rozmiar do pełnych sektorów
+        long tail = fsz - aln;           // ogon: ostatnie < 4096 bajtów
+
+        // Otwórz cel: NO_BUFFERING+WRITE_THROUGH (zapis prosto na nośnik, bez cache OS)
+        IntPtr dH = CF(dst, GW, 0, IntPtr.Zero, CA, NB|WT, IntPtr.Zero);
+        if (dH == INV) { CloseHandle(sH); return "ERR_DST:" + Marshal.GetLastWin32Error(); }
+
+        // Dwa wyrównane bufory do double-bufferingu
+        IntPtr rA = Marshal.AllocHGlobal((int)chunk + SEC);
+        IntPtr rB = Marshal.AllocHGlobal((int)chunk + SEC);
+        IntPtr bA = new IntPtr(((rA.ToInt64() + SEC - 1) / SEC) * SEC);
+        IntPtr bB = new IntPtr(((rB.ToInt64() + SEC - 1) / SEC) * SEC);
+        IntPtr[] bufs = new IntPtr[] { bA, bB };
+        string er = null;
+
+        try {
+            // readSem (count=2): writer zwalnia slot po każdym zakończonym zapisie
+            //   → sygnalizuje: "ten bufor jest wolny, można nadpisać"
+            // writeQ (cap=2): reader produkuje (ptr,size), writer konsumuje FIFO
+            //   → zapewnia że reader jest max 2 chunki przed writerem
+            var readSem = new SemaphoreSlim(2, 2);
+            var writeQ  = new BlockingCollection<Tuple<IntPtr,int>>(2);
+
+            // Wątek zapisu (consumer) — działa równolegle z odczytem
+            var writerTask = Task.Run(() => {
+                foreach (var item in writeQ.GetConsumingEnumerable()) {
+                    if (item.Item2 <= 0) { readSem.Release(); break; } // sentinel
+                    uint bw = 0;
+                    if (!WriteFile(dH, item.Item1, (uint)item.Item2, out bw, IntPtr.Zero))
+                        Interlocked.CompareExchange(ref er, "ERR_WRITE:" + Marshal.GetLastWin32Error(), null);
+                    prog[0] += bw;
+                    readSem.Release(); // bufor wolny do ponownego użycia
+                }
+            });
+
+            // Pętla odczytu (producer) — odczyt bi%2 podczas gdy writer pisze (bi-1)%2
+            int bi = 0; long rem = aln;
+            while (rem > 0 && er == null) {
+                readSem.Wait();                     // czekaj na wolny bufor
+                IntPtr cur = bufs[bi & 1];
+                long toRead = Math.Min(chunk, rem);
+                uint br = 0;
+                if (!ReadFile(sH, cur, (uint)toRead, out br, IntPtr.Zero) || br == 0) {
+                    readSem.Release(); break;       // błąd lub EOF
+                }
+                writeQ.Add(Tuple.Create(cur, (int)br));
+                rem -= br; bi++;
+            }
+            writeQ.Add(Tuple.Create(IntPtr.Zero, 0)); // sentinel: zakończ wątek zapisu
+            writerTask.Wait();
+        } finally {
+            Marshal.FreeHGlobal(rA); Marshal.FreeHGlobal(rB);
+            CloseHandle(sH); CloseHandle(dH);
+        }
+
+        if (er != null) return er;
+
+        // Ogon: ostatnie (fsz%4096) bajtów — nie są wyrównane, używamy normalnego I/O
+        if (tail > 0) {
+            IntPtr s2 = CF(src, GR, SR, IntPtr.Zero, OE, SS, IntPtr.Zero);
+            IntPtr d2 = CF(dst, GW, 0,  IntPtr.Zero, OE, WT, IntPtr.Zero);
+            if (s2 != INV && d2 != INV) {
+                long np = 0;
+                SetFilePointerEx(s2, aln, out np, 0);  // przewiń src do pozycji ogona
+                SetFilePointerEx(d2, 0,   out np, 2);  // przewiń dst na koniec (FILE_END=2)
+                IntPtr tb = Marshal.AllocHGlobal((int)tail + 16);
+                try {
+                    uint tr = 0, tw = 0;
+                    ReadFile(s2, tb, (uint)tail, out tr, IntPtr.Zero);
+                    if (tr > 0) { WriteFile(d2, tb, tr, out tw, IntPtr.Zero); prog[0] += tw; }
+                } finally { Marshal.FreeHGlobal(tb); }
+            }
+            if (s2 != INV) CloseHandle(s2);
+            if (d2 != INV) CloseHandle(d2);
+        }
+
+        // Obetnij plik do dokładnego rozmiaru (NO_BUFFERING mógł dopełnić ostatni sektor zerami)
+        IntPtr d3 = CF(dst, GW, 0, IntPtr.Zero, OE, 0u, IntPtr.Zero);
+        if (d3 != INV) {
+            long np = 0; SetFilePointerEx(d3, fsz, out np, 0); SetEndOfFile(d3); CloseHandle(d3);
+        }
+        return "OK";
+    }
+}
+'@ -ErrorAction Stop
+}
+# Helper: wywołanie NativeCopy z poziomu klasy — type resolution odroczone do call-time
+# (klasy PS resolwują [TypeName] w czasie parsowania, funkcje skryptowe — dopiero przy wywołaniu)
+function _Invoke-NativeCopy {
+    param([string]$Src, [string]$Dst, [int]$ChunkMB, [long[]]$Prog)
+    return [NativeCopy]::Copy($Src, $Dst, $ChunkMB, $Prog)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # FastFileCopy — inteligentne kopiowanie/przenoszenie plików
 # Kontrolowane przez ENGINE, używa RAMCache jako bufor
 # Strategie: SmallBatch (parallel), LargeStream (sequential), Mix (adaptive)
@@ -18314,10 +18837,12 @@ class FastFileCopy {
     
     # ── Drive info cache ──
     [hashtable] $DriveTypes            # "C:" → "SSD" | "HDD" | "Network"
+    [long] $LargeChunkBytes            # Dynamiczny rozmiar chunka dla dużych plików (RAM-based)
     
     FastFileCopy() {
         $this.SmallFileThreshold = 1MB
         $this.LargeBufferSize = 4MB
+        $this.LargeChunkBytes = 128MB
         $this.RAMBufferMaxMB = 512
         $this.VerifyAfterCopy = $false
         $this.PreserveTimestamps = $true
@@ -18326,28 +18851,43 @@ class FastFileCopy {
         $this.Errors = [System.Collections.Generic.List[string]]::new()
         $this.DriveTypes = @{}
         
-        # Auto-skaluj do RAM
+        # Skaluj wątki wg total RAM (CPU bound)
         try {
             $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
             $totalGB = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-            if ($totalGB -ge 32) {
-                $this.ParallelThreads = 16
-                $this.RAMBufferMaxMB = 2048
-                $this.LargeBufferSize = 8MB
-            } elseif ($totalGB -ge 16) {
-                $this.ParallelThreads = 12
-                $this.RAMBufferMaxMB = 1024
-                $this.LargeBufferSize = 4MB
-            } else {
-                $this.ParallelThreads = 8
-                $this.RAMBufferMaxMB = 512
-                $this.LargeBufferSize = 2MB
-            }
-        } catch {
-            $this.ParallelThreads = 8
-        }
+            if     ($totalGB -ge 32) { $this.ParallelThreads = 16 }
+            elseif ($totalGB -ge 16) { $this.ParallelThreads = 12 }
+            else                     { $this.ParallelThreads = 8  }
+        } catch { $this.ParallelThreads = 8 }
         
+        # RAMBufferMaxMB i LargeChunkBytes → bazują na WOLNYM RAM (nie total)
+        $this.RecalcRAMBudget()
         $this.DetectDriveTypes()
+    }
+    
+    # ═══ DYNAMICZNY BUDŻET RAM — wywołuj przed każdym Copy ═══
+    [int] GetFreeRAMMB() {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            return [int]($os.FreePhysicalMemory / 1KB)   # FreePhysicalMemory jest w KB
+        } catch { return 512 }
+    }
+    
+    [void] RecalcRAMBudget() {
+        $freeMB = $this.GetFreeRAMMB()
+        # Użyj max 50% wolnego RAM, min 256MB, max 8192MB
+        $budgetMB = [Math]::Max(256, [Math]::Min(8192, [int]($freeMB * 0.50)))
+        $this.RAMBufferMaxMB = $budgetMB
+        
+        # Chunk dla dużych plików: do 25% wolnego RAM per plik (min 64MB, max 2048MB)
+        $chunkMB = [Math]::Max(64, [Math]::Min(2048, [int]($freeMB * 0.25)))
+        $this.LargeChunkBytes = [long]$chunkMB * 1MB
+        
+        # LargeBufferSize (stream fallback) skaluj też
+        $this.LargeBufferSize = if ($freeMB -ge 4096) { 32MB }
+                                elseif ($freeMB -ge 2048) { 16MB }
+                                elseif ($freeMB -ge 1024) { 8MB  }
+                                else { 4MB }
     }
     
     # ═══ WYKRYWANIE TYPU DYSKU ═══
@@ -18442,6 +18982,9 @@ class FastFileCopy {
         
         $this.TotalFiles = $analysis.TotalFiles
         $this.TotalBytes = $analysis.TotalBytes
+        
+        # Odśwież budżet RAM tuż przed kopią (wolny RAM mógł się zmienić)
+        $this.RecalcRAMBudget()
         
         $srcDrive = $this.GetDriveType($source)
         $dstDrive = $this.GetDriveType($destination)
@@ -18567,9 +19110,10 @@ class FastFileCopy {
         $pool.Dispose()
     }
     
-    # ═══ DUŻE PLIKI — SEQUENTIAL z dużym buforem ═══
+    # ═══ DUŻE PLIKI — NativeCopy (FILE_FLAG_NO_BUFFERING + double-buffer) ═══
+    # Lokalny dysk: używa Win32 NO_BUFFERING+WRITE_THROUGH — omija cache OS całkowicie
+    # Sieć/błąd: fallback do managed FileStream z WriteThrough
     [void] CopyLargeFilesStream([System.Collections.Generic.List[System.IO.FileInfo]]$files, [string]$srcRoot, [string]$dst, [bool]$move) {
-        $buffer = [byte[]]::new($this.LargeBufferSize)
         
         foreach ($fi in $files) {
             if ($this.IsCancelled) { break }
@@ -18584,28 +19128,33 @@ class FastFileCopy {
                     [System.IO.Directory]::CreateDirectory($dstDir) | Out-Null
                 }
                 
-                # Streaming copy z dużym buforem
-                $srcStream = [System.IO.FileStream]::new($fi.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, $this.LargeBufferSize, [System.IO.FileOptions]::SequentialScan)
-                $dstStream = [System.IO.FileStream]::new($dstPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, $this.LargeBufferSize)
+                # Sprawdź czy lokalne dyski — NativeCopy nie działa na sieciowych udziałach
+                $srcIsLocal = -not $fi.FullName.StartsWith('\\')
+                $dstIsLocal = -not $dstPath.StartsWith('\\')
+                $nativeAvail = ([System.Management.Automation.PSTypeName]'NativeCopy').Type -ne $null
                 
-                try {
-                    $bytesRead = 0
-                    do {
-                        $bytesRead = $srcStream.Read($buffer, 0, $buffer.Length)
-                        if ($bytesRead -gt 0) {
-                            $dstStream.Write($buffer, 0, $bytesRead)
-                            $this.CopiedBytes += $bytesRead
-                        }
-                        # Update speed co 16MB
-                        if (($this.CopiedBytes % (16MB)) -lt $this.LargeBufferSize) {
-                            $elapsed = $this.Timer.Elapsed.TotalSeconds
-                            if ($elapsed -gt 0) { $this.SpeedMBps = [Math]::Round(($this.CopiedBytes / 1MB) / $elapsed, 1) }
-                        }
-                    } while ($bytesRead -gt 0 -and -not $this.IsCancelled)
-                } finally {
-                    $dstStream.Flush()
-                    $dstStream.Dispose()
-                    $srcStream.Dispose()
+                if ($srcIsLocal -and $dstIsLocal -and $nativeAvail) {
+                    # ─── ŚCIEŻKA NATYWNA: NO_BUFFERING+WRITE_THROUGH+double-buffer ───
+                    # Omija Windows Cache Manager całkowicie — dane: dysk→RAM→dysk
+                    # Chunk = 25% wolnego RAM (RecalcRAMBudget ustawia LargeChunkBytes)
+                    $chunkMB = [int]($this.LargeChunkBytes / 1MB)
+                    if ($chunkMB -lt 16) { $chunkMB = 16 }    # min 16MB per chunk
+                    if ($chunkMB -gt 2048) { $chunkMB = 2048 } # max 2GB per chunk
+                    
+                    $progress = [long[]]@(0)
+                    $result = _Invoke-NativeCopy $fi.FullName $dstPath $chunkMB $progress
+                    
+                    if ($result -eq 'OK') {
+                        $this.CopiedBytes += $fi.Length
+                        $this.CopiedFiles++
+                    } else {
+                        # Fallback do managed I/O jeśli native się wysypie
+                        $this.Errors.Add("NativeCopy fallback '$($fi.Name)': $result")
+                        $this._CopyFileManaged($fi, $dstPath)
+                    }
+                } else {
+                    # ─── ŚCIEŻKA MANAGED: sieć lub NativeCopy niedostępne ───
+                    $this._CopyFileManaged($fi, $dstPath)
                 }
                 
                 if ($this.PreserveTimestamps) {
@@ -18615,12 +19164,52 @@ class FastFileCopy {
                 
                 if ($move -and -not $this.IsCancelled) { [System.IO.File]::Delete($fi.FullName) }
                 
-                $this.CopiedFiles++
+                # Aktualizuj prędkość
+                $elapsed = $this.Timer.Elapsed.TotalSeconds
+                if ($elapsed -gt 0) { $this.SpeedMBps = [Math]::Round(($this.CopiedBytes / 1MB) / $elapsed, 1) }
+                
             } catch {
                 $this.FailedFiles++
                 $this.Errors.Add("Stream '$($fi.Name)': $_")
             }
         }
+    }
+    
+    # Managed fallback: FileStream z WriteThrough (tylko gdy NativeCopy niedostępne lub błąd)
+    hidden [void] _CopyFileManaged([System.IO.FileInfo]$fi, [string]$dstPath) {
+        $chunkBuf = [byte[]]::new($this.LargeChunkBytes)
+        $srcStream = [System.IO.FileStream]::new(
+            $fi.FullName,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            [int][Math]::Min($this.LargeBufferSize, [int]::MaxValue),
+            [System.IO.FileOptions]::SequentialScan)
+        $dstStream = [System.IO.FileStream]::new(
+            $dstPath,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            [int][Math]::Min($this.LargeBufferSize, [int]::MaxValue),
+            [System.IO.FileOptions]::WriteThrough)
+        try {
+            $totalInChunk = 0
+            do {
+                $n = $srcStream.Read($chunkBuf, $totalInChunk, [int]($this.LargeChunkBytes - $totalInChunk))
+                $totalInChunk += $n
+                if ($n -le 0 -or $totalInChunk -ge $this.LargeChunkBytes) {
+                    if ($totalInChunk -gt 0) {
+                        $dstStream.Write($chunkBuf, 0, $totalInChunk)
+                        $this.CopiedBytes += $totalInChunk
+                        $totalInChunk = 0
+                    }
+                }
+            } while ($n -gt 0 -and -not $this.IsCancelled)
+        } finally {
+            $dstStream.Flush(); $dstStream.Dispose(); $srcStream.Dispose()
+            $chunkBuf = $null
+        }
+        $this.CopiedFiles++
     }
     
     # ═══ PROGRESS INFO ═══
@@ -18672,30 +19261,20 @@ function Invoke-FastCopy {
     
     $analysis = $fc.AnalyzeSource($Source)
     $strategy = $fc.SelectStrategy($analysis, $fc.GetDriveType($Source), $fc.GetDriveType($Destination))
-    $totalMB = [Math]::Round($analysis.TotalBytes / 1MB, 1)
+    $totalMB   = [Math]::Round($analysis.TotalBytes / 1MB, 1)
+    $chunkMB   = [Math]::Round($fc.LargeChunkBytes / 1MB, 0)
+    $budgetMB  = $fc.RAMBufferMaxMB
+    $freeMB    = $fc.GetFreeRAMMB()
     
-    Write-Host "═══ FastCopy ═══" -ForegroundColor Cyan
-    Write-Host "  Source: $Source" -ForegroundColor White
-    Write-Host "  Dest:   $Destination" -ForegroundColor White
-    Write-Host "  Files:  $($analysis.TotalFiles) ($totalMB MB) [$($analysis.SmallFiles) small + $($analysis.LargeFiles) large]" -ForegroundColor White
-    Write-Host "  Strategy: $strategy | Threads: $($fc.ParallelThreads) | Buffer: $([Math]::Round($fc.LargeBufferSize/1MB,0))MB" -ForegroundColor Yellow
+    Write-Host "═══ FastCopy (RAM-Cache) ═══" -ForegroundColor Cyan
+    Write-Host "  Source:   $Source" -ForegroundColor White
+    Write-Host "  Dest:     $Destination" -ForegroundColor White
+    Write-Host "  Files:    $($analysis.TotalFiles) ($totalMB MB) [$($analysis.SmallFiles) small + $($analysis.LargeFiles) large]" -ForegroundColor White
+    Write-Host "  Strategy: $strategy | Threads: $($fc.ParallelThreads)" -ForegroundColor Yellow
+    Write-Host "  RAM:      wolne=${freeMB}MB  budzet=${budgetMB}MB  chunk-duze=${chunkMB}MB  stream-buf=$([Math]::Round($fc.LargeBufferSize/1MB,0))MB" -ForegroundColor Cyan
     Write-Host ""
     
-    # Kopiuj z progress
-    if (-not $NoProgress) {
-        $job = Start-Job -ScriptBlock {
-            param($src, $dst, $mv, $ver)
-            Add-Type -AssemblyName System.Management.Automation
-            $fc2 = [FastFileCopy]::new()
-            if ($ver) { $fc2.VerifyAfterCopy = $true }
-            return $fc2.Copy($src, $dst, $mv)
-        } -ArgumentList $Source, $Destination, $Move.IsPresent, $Verify.IsPresent
-        
-        # Fallback: synchronous copy z inline progress
-        $result = $fc.Copy($Source, $Destination, $Move.IsPresent)
-    } else {
-        $result = $fc.Copy($Source, $Destination, $Move.IsPresent)
-    }
+    $result = $fc.Copy($Source, $Destination, $Move.IsPresent)
     
     # Wynik
     Write-Host ""
@@ -20630,7 +21209,9 @@ $Script:PreviousEnsembleEnabled = $false
                                     $procName = $fgProc.ProcessName
                                     $appRAMCache.LearnName($currentForeground, $procName)
                                     # Ucz się ścieżki pod ProcessName (nie DisplayName)
-                                    if (-not $appRAMCache.AppPaths.ContainsKey($procName) -and $fgProc.Path) {
+                                    # v43.15: pomijaj junk paths (VS Code extensions, temp instalatory)
+                                    if (-not $appRAMCache.AppPaths.ContainsKey($procName) -and $fgProc.Path -and
+                                        -not $appRAMCache.IsJunkExePath($fgProc.Path)) {
                                         $appRAMCache.AppPaths[$procName] = @{ ExePath = $fgProc.Path; Dir = [System.IO.Path]::GetDirectoryName($fgProc.Path) }
                                     }
                                 }
@@ -22075,7 +22656,8 @@ $Script:PreviousEnsembleEnabled = $false
                     $appRAMCache.DetectSession($currentContext, $ctxGpuLoad)
                     
                     # Core: AI Tick (guard band, page fault, eviction, pressure)
-                    $appRAMCache.AITick($prophetApps, $chainTrans)
+                    # v43.15: Przekazujemy score/mode/context z silnika AI do RAMCache
+                    $appRAMCache.AITick($prophetApps, $chainTrans, [double]$aiDecision.Score, $currentState, $currentContext)
                     # Core: Batch tick — pliki w porcjach
                     $appRAMCache.BatchTick() | Out-Null
                     
@@ -22127,7 +22709,7 @@ $Script:PreviousEnsembleEnabled = $false
                     Mode = $currentState
                     Activity = Get-UserActivityStatus
                     Context = $currentContext
-                    Iteration = ($qLearning.TotalUpdates + $bandit.TotalPulls + $genetic.Generation + $selfTuner.DecisionHistory.Count + $chainPredictor.TotalPredictions + $Prophet.GetAppCount() + $Brain.TotalDecisions)
+                    Iteration = $iteration  # v43.15 FIX: monotonic tick counter
                     CPUHistory = $cpuHistory.ToArray()
                     TempHistory = $tempHistory.ToArray()
                     RAM = $ramUsedPercent
@@ -22388,7 +22970,7 @@ $Script:PreviousEnsembleEnabled = $false
                     ECoreCount = $Script:ECoreCount
                     Reason = $aiDecision.Reason
                     App = $currentActiveApp
-                    Iteration = ($qLearning.TotalUpdates + $bandit.TotalPulls + $genetic.Generation + $selfTuner.DecisionHistory.Count + $chainPredictor.TotalPredictions + $Prophet.GetAppCount() + $Brain.TotalDecisions)
+                    Iteration = $iteration  # v43.15 FIX: monotonic tick counter (was AI-sum that could plateau causing SELF-HEAL loops)
                     ActivityLog = @($Script:ActivityLog | Select-Object -First 5)
                     DecisionHistory = @($Script:DecisionHistory | Select-Object -First 30)
                     RAMIntelligenceHistory = @($Script:RAMIntelligenceHistory | Select-Object -First 30)
