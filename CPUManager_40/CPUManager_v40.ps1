@@ -5449,9 +5449,18 @@ function Detect-AvailableMetrics {
 }
 # --- Cached Cim/WMI helpers to reduce syscall frequency ---
 function Get-LHMSensorsCached {
-    param([int]$ttl = 0)  # CPU load musi byc zawsze swiezy, nie cache'uj!
+    param([int]$ttl = 800)  # Cache 800ms - swiezy dla CPU mgmt, bez zbednych CIM queries
     if (-not $Script:DataSourcesInfo.LHMAvailable) { return $null }
-    try { return Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop } catch { return $null }
+    if (-not $Script:LHMSensorsCacheTime) { $Script:LHMSensorsCacheTime = [DateTime]::MinValue }
+    try {
+        if ($Script:LHMSensorsCache -and (([DateTime]::Now - $Script:LHMSensorsCacheTime).TotalMilliseconds -lt $ttl)) { return $Script:LHMSensorsCache }
+    } catch { }
+    try {
+        $s = Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop
+        $Script:LHMSensorsCache = $s
+        $Script:LHMSensorsCacheTime = [DateTime]::Now
+        return $s
+    } catch { return $Script:LHMSensorsCache }
 }
 function Get-LHMHardwareCached {
     param([int]$ttl = 30000)  #  v39.20: 30 sekund
@@ -5463,9 +5472,18 @@ function Get-LHMHardwareCached {
     try { $s = Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Hardware -ErrorAction SilentlyContinue; $Script:LHMHardwareCache = $s; $Script:LHMHardwareCacheTime = [DateTime]::Now; return $s } catch { return $Script:LHMHardwareCache }
 }
 function Get-OHMSensorsCached {
-    param([int]$ttl = 0)  # CPU load musi byc zawsze swiezy, nie cache'uj!
+    param([int]$ttl = 800)  # Cache 800ms - swiezy dla CPU mgmt, bez zbednych CIM queries
     if (-not $Script:DataSourcesInfo.OHMAvailable) { return $null }
-    try { return Get-CimInstance -Namespace "root\OpenHardwareMonitor" -ClassName Sensor -ErrorAction Stop } catch { return $null }
+    if (-not $Script:OHMSensorsCacheTime) { $Script:OHMSensorsCacheTime = [DateTime]::MinValue }
+    try {
+        if ($Script:OHMSensorsCache -and (([DateTime]::Now - $Script:OHMSensorsCacheTime).TotalMilliseconds -lt $ttl)) { return $Script:OHMSensorsCache }
+    } catch { }
+    try {
+        $s = Get-CimInstance -Namespace "root\OpenHardwareMonitor" -ClassName Sensor -ErrorAction Stop
+        $Script:OHMSensorsCache = $s
+        $Script:OHMSensorsCacheTime = [DateTime]::Now
+        return $s
+    } catch { return $Script:OHMSensorsCache }
 }
 function Get-ACPIThermalCached {
     param([int]$ttl = 30000)  #  v39.20: 30 sekund
@@ -20133,6 +20151,11 @@ function Main {
     # Global flags for tray/dashboard
     $Global:ExitRequested = $false
     $Global:ManualOverride = $null
+    # Zmienne pomocnicze cache - inicjalizacja przed petla glowna
+    $Script:LastFgHwndRaw = [IntPtr]::Zero
+    $Script:LastFgRawPN = $null
+    $Script:NetAdaptersAsyncPS = $null
+    $Script:NetAdaptersAsyncResult = $null
     # Obsluga Ctrl+C - traktuj jako input, nie jako przerwanie
     try { [Console]::TreatControlCAsInput = $true } catch { }
     # - DETEKCJA ZRODEL DANYCH - wykryj dostepne LHM/OHM/System
@@ -20869,7 +20892,8 @@ $Script:PreviousEnsembleEnabled = $false
                 }
             }
 
-            # Aktualizuj statystyki sieci w kazdej iteracji
+            # Aktualizuj statystyki sieci co 10 iteracji (~10s) - totale sesji nie musza byc co sekunde
+            if ($iteration % 10 -eq 0) {
             try {
                 $adapters = Get-NetAdapterStatistics -ErrorAction SilentlyContinue | Where-Object { $_.ReceivedBytes -gt 0 -or $_.SentBytes -gt 0 }
                 if ($adapters) {
@@ -20878,6 +20902,7 @@ $Script:PreviousEnsembleEnabled = $false
                 }
             } catch {
                 # Windows shutting down / sleep / network unavailable - ignore
+            }
             }
             # Process WinForms events for tray icon responsiveness
             [System.Windows.Forms.Application]::DoEvents()
@@ -20991,11 +21016,30 @@ $Script:PreviousEnsembleEnabled = $false
             # - Network speed monitoring + Total counters
             try {
                 # Eliminacja busy cursor przy starcie ENGINE
-                if (($iteration % 5) -eq 0 -or -not $Script:CachedNetAdapters) {
-                    # Asynchroniczny update cache - ZAWSZE (nawet przy pierwszym razie)
+                # Najpierw: odbierz wynik poprzedniego async query jesli gotowy
+                if ($Script:NetAdaptersAsyncPS -and $Script:NetAdaptersAsyncResult) {
                     try {
-                        $ps = [powershell]::Create()
-                        $null = $ps.AddScript({
+                        if ($Script:NetAdaptersAsyncResult.IsCompleted) {
+                            try {
+                                $result = $Script:NetAdaptersAsyncPS.EndInvoke($Script:NetAdaptersAsyncResult)
+                                if ($result) { $Script:CachedNetAdapters = $result }
+                            } catch { }
+                            $Script:NetAdaptersAsyncPS.Dispose()
+                            $Script:NetAdaptersAsyncPS = $null
+                            $Script:NetAdaptersAsyncResult = $null
+                        }
+                    } catch {
+                        try { $Script:NetAdaptersAsyncPS.Dispose() } catch { }
+                        $Script:NetAdaptersAsyncPS = $null
+                        $Script:NetAdaptersAsyncResult = $null
+                    }
+                }
+                if (($iteration % 5) -eq 0 -or -not $Script:CachedNetAdapters) {
+                    # Asynchroniczny update cache - tylko gdy poprzedni juz skonczony
+                    if (-not $Script:NetAdaptersAsyncPS) {
+                    try {
+                        $psNet = [powershell]::Create()
+                        $null = $psNet.AddScript({
                             try {
                                 $adapters = Get-CimInstance -ClassName Win32_PerfRawData_Tcpip_NetworkInterface -ErrorAction SilentlyContinue |
                                     Where-Object {
@@ -21008,20 +21052,12 @@ $Script:PreviousEnsembleEnabled = $false
                             }
                         })
                         # BeginInvoke - asynchroniczne wykonanie (NIE blokuje!)
-                        $asyncResult = $ps.BeginInvoke()
-                        # Sprawdz czy juz gotowe (non-blocking check)
-                        if ($asyncResult.IsCompleted) {
-                            try {
-                                $result = $ps.EndInvoke($asyncResult)
-                                if ($result) {
-                                    $Script:CachedNetAdapters = $result
-                                }
-                                $ps.Dispose()
-                            } catch { }
-                        }
-                        # Jesli nie gotowe - uzyj starego cache lub poczekaj na nastepna iteracje
+                        $Script:NetAdaptersAsyncPS = $psNet
+                        $Script:NetAdaptersAsyncResult = $psNet.BeginInvoke()
                     } catch {
                         # W razie bledu - uzyj starego cache
+                        if ($psNet) { try { $psNet.Dispose() } catch {} }
+                    }
                     }
                 }
                 $netAdapters = $Script:CachedNetAdapters
@@ -21289,15 +21325,17 @@ $Script:PreviousEnsembleEnabled = $false
             # Aktualizuj nowe komponenty AI
             [void]$contextDetector.UpdateActiveApps($currentForeground, $currentMetrics.CPU)
             # Dodaj raw ProcessName do ActiveApps (np. "TormentedSouls2-Win64-Shipping")
+            # Cache: sprawdzaj Get-Process tylko gdy zmienil sie uchwyt okna
             try {
                 $hwnd2 = [Win32]::GetForegroundWindow()
                 if ($hwnd2 -ne [IntPtr]::Zero) {
-                    $pid3 = 0; [Win32]::GetWindowThreadProcessId($hwnd2, [ref]$pid3) | Out-Null
-                    if ($pid3 -gt 0) { 
-                        $rawPN = (Get-Process -Id $pid3 -ErrorAction SilentlyContinue).ProcessName
-                        if ($rawPN -and $rawPN -ne $currentForeground) {
-                            [void]$contextDetector.UpdateActiveApps($rawPN, $currentMetrics.CPU)
-                        }
+                    if ($hwnd2 -ne $Script:LastFgHwndRaw) {
+                        $Script:LastFgHwndRaw = $hwnd2
+                        $pid3 = 0; [Win32]::GetWindowThreadProcessId($hwnd2, [ref]$pid3) | Out-Null
+                        $Script:LastFgRawPN = if ($pid3 -gt 0) { (Get-Process -Id $pid3 -ErrorAction SilentlyContinue).ProcessName } else { $null }
+                    }
+                    if ($Script:LastFgRawPN -and $Script:LastFgRawPN -ne $currentForeground) {
+                        [void]$contextDetector.UpdateActiveApps($Script:LastFgRawPN, $currentMetrics.CPU)
                     }
                 }
             } catch {}
