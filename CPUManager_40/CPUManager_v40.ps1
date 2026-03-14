@@ -3321,6 +3321,8 @@ function Get-OptimalTDPProfile {
         if ($Temp -lt 75) { return "Extreme" }
         return "Turbo"
     }
+    # Audio/DAW context: minimum Balanced — Silent = buffer underruns = dropouty audio
+    if ($Context -eq "Audio") { return "Balanced" }
     # Heavy work
     if ($Context -eq "Heavy" -or $CPU -gt $Script:TurboThreshold) {
         if ($Temp -lt 78) { return "Turbo" }
@@ -3455,6 +3457,8 @@ function Set-IntelPowerMode {
 function Set-IntelBackgroundAffinity {
     param([hashtable]$PM, [long]$mask)
     try {
+        # AUDIO SAFE MODE: DAW/VST wymaga pełnego dostępu do CPU — zmiana affinity = dropout
+        if ($Script:CurrentAppContext -eq "Audio") { return }
         # PERFORMANCE FIX v40.3: Throttle — max raz na 5 sekund
         $now = [DateTime]::UtcNow
         if ($PM._LastBgAffinityCheck -and ($now - $PM._LastBgAffinityCheck).TotalSeconds -lt 5.0) { return }
@@ -3463,7 +3467,9 @@ function Set-IntelBackgroundAffinity {
         $fgHwnd = [Win32]::GetForegroundWindow()
         $fgPid = 0
         if ($fgHwnd -ne [IntPtr]::Zero) { [Win32]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null }
-        $protected = @("System","Idle","svchost","csrss","smss","lsass","services","wininit","dwm","explorer","powershell","CPUManager","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","RuntimeBroker","dllhost","ctfmon","audiodg")
+        $protected = @("System","Idle","svchost","csrss","smss","lsass","services","wininit","dwm","explorer","powershell","CPUManager","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","RuntimeBroker","dllhost","ctfmon","audiodg",
+            "kontakt","kontakt7","kontakt6","vstbridge","vstbridge64","jbridge","jbridge64","audiogridder",
+            "cubase","cubase13","reaper","reaper64","fl64","flstudio","bitwig","ableton","studioone","nuendo","protools")
         $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
             $_.Id -ne $fgPid -and $_.Id -gt 4 -and $_.WorkingSet64 -gt 20MB -and $protected -notcontains $_.ProcessName
         } | Sort-Object WorkingSet64 -Descending | Select-Object -First 15
@@ -3496,6 +3502,8 @@ function Restore-IntelAffinities {
 function Set-IntelBackgroundPriority {
     param([hashtable]$PM, [bool]$throttle)
     try {
+        # AUDIO SAFE MODE: Nie obniżaj priorytetów procesów gdy DAW/VST aktywne — powoduje buffer underruns
+        if ($throttle -and $Script:CurrentAppContext -eq "Audio") { return }
         # PERFORMANCE FIX v40.3: Throttle — max raz na 5 sekund (Get-Process = 50-200ms + CPU spike)
         $now = [DateTime]::UtcNow
         if ($PM._LastBgPriorityCheck -and ($now - $PM._LastBgPriorityCheck).TotalSeconds -lt 5.0) { return }
@@ -3504,8 +3512,10 @@ function Set-IntelBackgroundPriority {
         $fgHwnd = [Win32]::GetForegroundWindow()
         $fgPid = 0
         if ($fgHwnd -ne [IntPtr]::Zero) { [Win32]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null }
-        # Shell/system procesy NIGDY nie throttle — bez tego = białe ikony, zamrożony UI
-        $shellProtected = @("System","Idle","svchost","csrss","smss","lsass","services","wininit","dwm","explorer","powershell","pwsh","CPUManager","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","RuntimeBroker","dllhost","ctfmon","audiodg","conhost","fontdrvhost","SearchHost","StartMenuExperienceHost","winlogon","SecurityHealthService","MsMpEng")
+        # Shell/system + audio/DAW procesy NIGDY nie throttle — bez tego = dropout, zamrożony UI
+        $shellProtected = @("System","Idle","svchost","csrss","smss","lsass","services","wininit","dwm","explorer","powershell","pwsh","CPUManager","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","RuntimeBroker","dllhost","ctfmon","audiodg","conhost","fontdrvhost","SearchHost","StartMenuExperienceHost","winlogon","SecurityHealthService","MsMpEng",
+            "kontakt","kontakt7","kontakt6","vstbridge","vstbridge64","jbridge","jbridge64","audiogridder",
+            "cubase","cubase13","reaper","reaper64","fl64","flstudio","bitwig","ableton","studioone","nuendo","protools")
         $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
             $_.Id -ne $fgPid -and $_.Id -gt 4 -and $_.WorkingSet64 -gt 30MB -and $shellProtected -notcontains $_.ProcessName
         } | Select-Object -First 20
@@ -6302,8 +6312,8 @@ class SystemGovernor {
                 $fps = Get-Process -Name $fgApp -ErrorAction SilentlyContinue
                 foreach ($fp in $fps) { try { if ($fp.PriorityClass -ne $tgt) { $fp.PriorityClass = $tgt; $r.GovernedCount++ }; $fp.Dispose() } catch { try { $fp.Dispose() } catch {} } }
             }
-            # Background demotion in overload/Silent
-            if ($this.IsOverloaded -or $mode -eq "Silent") {
+            # Background demotion in overload/Silent — skip when Audio/DAW active (would cause buffer underruns)
+            if (($this.IsOverloaded -or $mode -eq "Silent") -and $Script:CurrentAppContext -ne "Audio") {
                 $bgPri = if ($this.IsOverloaded) { [System.Diagnostics.ProcessPriorityClass]::Idle } else { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
                 $protected = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
                 foreach ($p in @("System","Idle","Registry","smss","csrss","wininit","services","lsass","winlogon","svchost","dwm","explorer","audiodg","ctfmon","MsMpEng","powershell","pwsh","CPUManager","RuntimeBroker","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","dllhost")) { [void]$protected.Add($p) }
@@ -10325,6 +10335,13 @@ class PerformanceBooster {
         "ShellExperienceHost" = $true; "ApplicationFrameHost" = $true
         "TextInputHost" = $true; "ShellHost" = $true
         "WindowsTerminal" = $true; "WmiPrvSE" = $true
+        # Audio/DAW/VST — nigdy nie zamrażaj (dropout i cięcia dźwięku)
+        "kontakt" = $true; "kontakt7" = $true; "kontakt6" = $true
+        "vstbridge" = $true; "vstbridge64" = $true; "jbridge" = $true; "jbridge64" = $true
+        "audiogridder" = $true; "audiogridder-bridge" = $true
+        "cubase" = $true; "cubase13" = $true; "reaper" = $true; "reaper64" = $true
+        "fl64" = $true; "flstudio" = $true; "bitwig" = $true; "ableton" = $true
+        "studioone" = $true; "nuendo" = $true; "protools" = $true
     }
     # Heavy apps które wymagają boost (domyślna lista)
     [hashtable] $DefaultHeavyApps = @{
@@ -10486,6 +10503,8 @@ class PerformanceBooster {
     # 3. BACKGROUND FREEZE - Zamroź niepotrzebne procesy w tle
     [int] FreezeBackgroundProcesses([string]$foregroundApp) {
         if (-not $this.BackgroundFreezeEnabled) { return 0 }
+        # AUDIO SAFE MODE: Nigdy nie zamrażaj procesów gdy DAW/VST aktywne — cięcia dźwięku i dropout
+        if ($Script:CurrentAppContext -eq "Audio") { return 0 }
         $frozenCount = 0
         try {
             # Pobierz procesy używające dużo zasobów
@@ -22593,6 +22612,11 @@ $Script:PreviousEnsembleEnabled = $false
             }
             # #
             # #
+            # AUDIO SAFE MODE: Minimum Balanced gdy DAW/VST aktywne — Silent w czasie gry = dropout
+            if ($currentContext -eq "Audio" -and $currentState -eq "Silent" -and -not $Script:SilentLockMode -and -not $Script:UserForcedMode) {
+                $currentState = "Balanced"
+                if ($aiDecision) { $aiDecision.Reason = "AUDIO-SAFE: min Balanced (dropout prevention)" }
+            }
             # v43.14: HardLock flag → wyłącza dynamiczne skalowanie (strict Min/Max)
             $isHardLocked = $hardLockBlocked -or $Script:SilentLockMode -or $Script:BalancedLockMode -or ($Script:UserForcedMode -and $Script:UserForcedMode -ne "")
             # 1. USER FORCED MODE - uzytkownik wybral tryb, AI sie uczy ale nie zmienia trybu
