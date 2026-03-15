@@ -442,9 +442,9 @@ function Build-HardwareProfile {
         # Tier 2: standardowy
         # Tier 3: ostrożny, mały cache, priorytetyzuj tylko heavy apps
         CacheStrategy = switch ($tier) {
-            1 { @{ MaxStartupApps = 15; MaxIdlePreload = 10; MaxModules = 150; MaxSavedFiles = 120; BatchSize = 128MB; CachePercent = 0.50 } }
-            2 { @{ MaxStartupApps = 8;  MaxIdlePreload = 6;  MaxModules = 100; MaxSavedFiles = 80;  BatchSize = 64MB;  CachePercent = 0.40 } }
-            3 { @{ MaxStartupApps = 3;  MaxIdlePreload = 2;  MaxModules = 30;  MaxSavedFiles = 25;  BatchSize = 16MB;  CachePercent = 0.30 } }
+            1 { @{ MaxStartupApps = 15; MaxIdlePreload = 10; MaxModules = 200; MaxSavedFiles = 200; BatchSize = 128MB; CachePercent = 0.50 } }
+            2 { @{ MaxStartupApps = 8;  MaxIdlePreload = 6;  MaxModules = 120; MaxSavedFiles = 100; BatchSize = 64MB;  CachePercent = 0.40 } }
+            3 { @{ MaxStartupApps = 3;  MaxIdlePreload = 2;  MaxModules = 40;  MaxSavedFiles = 35;  BatchSize = 16MB;  CachePercent = 0.30 } }
         }
     }
     
@@ -472,7 +472,6 @@ $Script:dGPUVendor = ""         # NVIDIA/AMD
 # DEBUG LOGGING TO FILE - GPU-BOUND DETECTION TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════
 $Script:DebugLogPath = "C:\Temp\CPUManager_GPU-Debug.log"  # Debug/Info/GPU-Bound logi
-$Script:ErrorLogPath = "C:\CPUManager\bledy.txt"           # Tylko błędy (ENGINE + CONFIGURATOR)
 $Script:DebugLogEnabled = $true
 $Script:DebugLogIterationCounter = 0
 
@@ -538,32 +537,10 @@ function Write-ErrorLog {
         [string]$ErrorMessage,
         [string]$Details = ""
     )
-    
     try {
-        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        $logLine = "[$timestamp] [$Component] ERROR: $ErrorMessage"
-        if ($Details) {
-            $logLine += "`n    Details: $Details"
-        }
-        $logLine += "`n"
-        
-        # Upewnij się że folder istnieje
-        $logDir = Split-Path $Script:ErrorLogPath -Parent
-        if (-not (Test-Path $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-        }
-        
-        # Append do pliku C:\CPUManager\bledy.txt
-        Add-Content -Path $Script:ErrorLogPath -Value $logLine -Encoding UTF8 -ErrorAction SilentlyContinue
-        
-        # Opcjonalnie też do debug log (jeśli włączony)
-        if ($Script:DebugLogEnabled) {
-            Write-DebugLog "$Component ERROR: $ErrorMessage" "ERROR" $Component
-        }
-    }
-    catch {
-        # Cichy błąd - nie crashuj jeśli logging fails
-    }
+        $msg = if ($Details) { "$Component ERROR: $ErrorMessage | $Details" } else { "$Component ERROR: $ErrorMessage" }
+        Write-DebugLog $msg "ERROR" $Component
+    } catch {}
 }
 
 function Initialize-DebugLog {
@@ -14928,13 +14905,6 @@ class NetworkOptimizer {
         }
         if ($oldMode -ne $mode) {
             $this.TotalOptimizations++
-            # Log zmiany trybu (tylko w debug mode)
-            if ($Global:DebugMode) {
-                try {
-                    $logEntry = "$(Get-Date -Format 'HH:mm:ss') - NetworkOptimizer: $oldMode -> $mode"
-                    $logEntry | Out-File -FilePath 'C:\CPUManager\NetworkOptimizer.log' -Append -Encoding utf8
-                } catch { }
-            }
         }
     }
     # V40: Optymalizacja dla niskiego opóźnienia (Gaming)
@@ -16020,6 +15990,8 @@ class AppRAMCache {
     [double] $LastAIScore        # Ostatni score silnika AI (0-100); wysoki = heavy load
     [string] $LastAIMode         # Ostatni tryb AI: Turbo/Balanced/Silent
     [string] $LastAIContext      # Ostatni kontekst: Gaming/Work/Music/Browsing/Mixed/Idle
+    # ── AI Prophet reference — żywy widok danych Prophet (aktualizowany co AITick) ──
+    [hashtable] $ProphetAppsRef  # Referencja do prophet.Apps; $null gdy Prophet nieaktywny
     
     AppRAMCache() {
         $this.CachedApps = @{}
@@ -16093,6 +16065,7 @@ class AppRAMCache {
         # #4 Startup Time Learning
         $this.AppStartupMs = @{}
         $this.LaunchRaceStart = [datetime]::MinValue
+        $this.ProphetAppsRef = $null  # Wypełniane przez AITick co tick
         
         # ═══ SKALOWANIE DO HARDWARE (pkt 1,6,9 instrukcji) ═══
         try {
@@ -16430,7 +16403,11 @@ class AppRAMCache {
                 $budgetLeft = ($this.MaxCacheMB - $this.TotalCachedMB) * 1MB
                 $currentBatchSz = 0; foreach ($bf in $filesToLoadLO) { $currentBatchSz += $bf.Size }
                 if (($currentBatchSz + $f.Size) -gt $budgetLeft) { break }
-                $filesToLoadLO.Add(@{ Path = $f.Path; Size = $f.Size; Type = "learned" })
+                $lfp2 = [string]$f.Path
+                $lfType2 = if ($lfp2 -match '\\(Plugins|Extensions|VST2?|VST3|CLAP|LV2|Components)\\' -or
+                                $lfp2 -match '\.(vst3|clap|component)$' -or
+                                $lfp2 -match 'Common.Files\\(VST2?|CLAP|LV2)') { "plugin" } else { "learned" }
+                $filesToLoadLO.Add(@{ Path = $lfp2; Size = $f.Size; Type = $lfType2 })
                 $countLO++
             }
             if ($filesToLoadLO.Count -eq 0) {
@@ -16523,7 +16500,11 @@ class AppRAMCache {
                     $budgetLeft = ($this.MaxCacheMB - $this.TotalCachedMB) * 1MB
                     $currentBatch = 0; foreach ($f in $filesToLoad) { $currentBatch += $f.Size }
                     if (($currentBatch + $lf.Size) -gt $budgetLeft) { break }
-                    $filesToLoad.Add(@{ Path = $lf.Path; Size = $lf.Size; Type = "learned" })
+                    $lfpM = [string]$lf.Path
+                    $lfTypeM = if ($lfpM -match '\\(Plugins|Extensions|VST2?|VST3|CLAP|LV2|Components)\\' -or
+                                    $lfpM -match '\.(vst3|clap|component)$' -or
+                                    $lfpM -match 'Common.Files\\(VST2?|CLAP|LV2)') { "plugin" } else { "learned" }
+                    $filesToLoad.Add(@{ Path = $lfpM; Size = $lf.Size; Type = $lfTypeM })
                     $count++
                 }
                 $usedLearned = ($count -gt 0)
@@ -16839,7 +16820,12 @@ class AppRAMCache {
                 if ($ap.ContainsKey('LearnedFiles') -and $ap.LearnedFiles) {
                     foreach ($lf in $ap.LearnedFiles) {
                         if ($lf.Path -and $lf.Path -ne $ap.ExePath -and (Test-Path $lf.Path -EA SilentlyContinue)) {
-                            $learnedFiles.Add(@{ Path = [string]$lf.Path; Size = [long]$lf.Size; Type = "learned" })
+                            # Wykryj wtyczki: VST2/VST3/CLAP/LV2 lub katalogi Plugins/Extensions
+                            $lfp = [string]$lf.Path
+                            $lfType = if ($lfp -match '\\(Plugins|Extensions|VST2?|VST3|CLAP|LV2|Components)\\' -or
+                                           $lfp -match '\.(vst3|clap|component)$' -or
+                                           $lfp -match 'Common.Files\\(VST2?|CLAP|LV2)') { "plugin" } else { "learned" }
+                            $learnedFiles.Add(@{ Path = $lfp; Size = [long]$lf.Size; Type = $lfType })
                         }
                     }
                 }
@@ -17131,6 +17117,32 @@ class AppRAMCache {
             $conf = [Math]::Min(1.0, $entry.Value / 60.0)
             $this.PreloadApp($appName, $exePath, $conf) | Out-Null
         }
+
+        # CHILD PATTERN PRELOAD — dla kandydatów preloaduj też child procs tej sesji
+        # Np. znając Reaper → preloaduj vstbridge który zawsze towarzyszy w Gaming
+        if ($this.MemoryPressure -le 0.4) {
+            $idleSession = $this.CurrentSession
+            foreach ($entry2 in $sorted) {
+                $parentApp = $this.ResolveAppName($entry2.Name)
+                if (-not $this.AppPaths.ContainsKey($parentApp)) { continue }
+                $ap2 = $this.AppPaths[$parentApp]
+                if (-not $ap2.ContainsKey('ChildPatterns')) { continue }
+                if (-not $ap2.ChildPatterns.ContainsKey($idleSession)) { continue }
+                $childMap = $ap2.ChildPatterns[$idleSession]
+                $topChildren = $childMap.GetEnumerator() | Where-Object { $_.Value -ge 2 } | Sort-Object Value -Descending | Select-Object -First 3
+                foreach ($ce in $topChildren) {
+                    $childApp = $ce.Key
+                    if ($this.CachedApps.ContainsKey($childApp)) { continue }
+                    if ($this.MemoryPressure -gt 0.5) { break }
+                    $cExe = if ($this.AppPaths.ContainsKey($childApp)) { $this.AppPaths[$childApp].ExePath } else { "" }
+                    $cConf = [Math]::Min(0.9, [double]$ce.Value / 10.0)
+                    if (-not $this.LoadAppFromDiskCache($childApp)) {
+                        $this.PreloadApp($childApp, $cExe, $cConf) | Out-Null
+                    }
+                    Write-RCLog "CHILD IDLE PRELOAD '$childApp' (child of '$parentApp' w $idleSession, seen=$($ce.Value)x)"
+                }
+            }
+        }
     }
     
     # ═══════════════════════════════════════════════════════════════
@@ -17191,6 +17203,8 @@ class AppRAMCache {
         if ($aiScore -gt 0) { $this.LastAIScore = $aiScore }
         if (-not [string]::IsNullOrWhiteSpace($aiMode))    { $this.LastAIMode = $aiMode }
         if (-not [string]::IsNullOrWhiteSpace($aiContext)) { $this.LastAIContext = $aiContext }
+        # Zaktualizuj żywy widok danych Prophet (używany w ProfileAppModules do sortowania)
+        if ($prophetApps -and $prophetApps.Count -gt 0) { $this.ProphetAppsRef = $prophetApps }
 
         # v43.15: Gdy AI Score wysoki (Turbo / heavy load) → natychmiast chroń foreground app WS
         # AI wie że system jest pod obciążeniem — nie czekaj co 30s na ReassertProtectedWorkingSets
@@ -18020,6 +18034,7 @@ class AppRAMCache {
             # CHILD PROCESS SCAN: wykryj procesy potomne (VST bridge, plugin hosts, itp.)
             # Np. Ableton → vstbridge.exe, jBridge, VSTScanner, AudioGridder itp.
             $childModules = [System.Collections.Generic.List[object]]::new()
+            $childProcNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             try {
                 $allProcs = Get-Process -ErrorAction SilentlyContinue
                 $childPluginNames = @('vstbridge','vsthost','jbridge','audiogridder','wine','wineserver',
@@ -18040,6 +18055,7 @@ class AppRAMCache {
                         foreach ($ph in $childPluginNames) { if ($cpName -like "*$ph*") { $isChild = $true; break } }
                     }
                     if ($isChild -and $cp.Id -ne $proc.Id) {
+                        $childProcNames.Add($cp.ProcessName) | Out-Null
                         try {
                             $childMods = $cp.Modules | Where-Object { $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue) } | Select-Object -First 80
                             foreach ($cm in $childMods) { $childModules.Add($cm) }
@@ -18076,7 +18092,61 @@ class AppRAMCache {
             }
             
             if ($learnedFiles.Count -lt 2) { return }
-            
+
+            # Wczesne wykrycie serwisów wtyczek — DAW z vstservice/asioservice/clapservice
+            # potrzebuje większego limitu modułów (pluginy użytkownika = dziesiątki dodatkowych DLL)
+            $pluginSvcNames = @('vstservice','asioservice','clapservice','araservice','juceaudio')
+            $hasPlugSvc = $false
+            foreach ($lf in $learnedFiles) {
+                $fn = [System.IO.Path]::GetFileNameWithoutExtension($lf.Path).ToLower()
+                if ($fn -in $pluginSvcNames) { $hasPlugSvc = $true; break }
+            }
+            if ($hasPlugSvc) {
+                # DAW z plugin serwisem: podnieś limit tak jak HEAVY (+50%, max 250)
+                # Inaczej pluginy ładowane po starcie (po 90-120s) zastępują systemowe DLL zamiast dołączyć
+                $maxModules = [Math]::Min([int]($maxModules * 1.5), 250)
+            }
+
+            # ════════════════════════════════════════════════════════════
+            # AI-GUIDED MODULE PRIORITY — Prophet + session context
+            # HEAVY/Gaming: game assets > runtime/shader DLLs > inne moduły
+            # LIGHT: rozmiar malejący; Turbo preferred → +50% limit modułów
+            # ════════════════════════════════════════════════════════════
+            $aiPropCategory  = "LEARNING"
+            $aiPropPreferred = ""
+            if ($this.ProphetAppsRef -and $this.ProphetAppsRef.ContainsKey($appName)) {
+                $pd = $this.ProphetAppsRef[$appName]
+                $aiPropCategory  = if ($pd.Category)      { [string]$pd.Category }      else { "LEARNING" }
+                $aiPropPreferred = if ($pd.PreferredMode) { [string]$pd.PreferredMode } else { "" }
+                # Turbo/HEAVY → więcej modułów w cache (+50%)
+                if ($aiPropCategory -eq "HEAVY" -or $aiPropPreferred -eq "Turbo") {
+                    $maxModules = [Math]::Min([int]($maxModules * 1.5), 250)
+                }
+            }
+            $aiSessionCtx = $this.CurrentSession  # "Gaming"|"Work"|"Browsing"|"Mixed"
+            $scoredModules = foreach ($lf in $learnedFiles) {
+                $ms = 1.0
+                $mext  = [System.IO.Path]::GetExtension($lf.Path).ToLower()
+                $mname = [System.IO.Path]::GetFileName($lf.Path).ToLower()
+                # Typ pliku: game assets > runtime/shader DLLs > zwykłe DLLs
+                if ($mext  -in @('.pak','.pck','.bank','.ushaderbytecode','.shaderbundle','.oodle','.wem')) { $ms += 5.0 }
+                elseif ($mname -match 'runtime|core|clr|jit|v8|electron|cef|qt5core|libcef')               { $ms += 3.5 }
+                elseif ($mname -match 'd3d|vulkan|opengl|dxgi|nvapi|cuda|opencl|vk')                       { $ms += 3.5 }
+                elseif ($mext  -eq '.dll')                                                                  { $ms += 1.0 }
+                # Rozmiar: większy = bardziej krytyczny do zawarcia w cache
+                $ms += [Math]::Log10([Math]::Max(1, $lf.Size / 1KB)) * 0.4
+                # Gaming/Heavy bonus dla dużych plików (>10MB = shader pack / runtime)
+                if (($aiPropCategory -eq "HEAVY" -or $aiSessionCtx -eq "Gaming") -and $lf.Size -gt 10MB) { $ms += 2.5 }
+                @{ File = $lf; Score = $ms }
+            }
+            $learnedFiles = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($sm in ($scoredModules | Sort-Object { $_.Score } -Descending | Select-Object -First $maxModules)) {
+                $learnedFiles.Add($sm.File)
+            }
+            if ($aiPropCategory -ne "LEARNING") {
+                Write-RCLog "AI SORT '$appName': cat=$aiPropCategory mode=$aiPropPreferred sess=$aiSessionCtx maxMod=$maxModules"
+            }
+
             # v43.15: odrzuć procesy z junk ścieżką (VS Code extension binaries, temp instalatory)
             if ($this.IsJunkExePath($proc.Path)) {
                 Write-RCLog "PROFILE SKIP '$appName': junk exePath '$($proc.Path)'"
@@ -18086,14 +18156,52 @@ class AppRAMCache {
             # Zapisz do AppPaths
             if (-not $this.AppPaths.ContainsKey($appName)) {
                 $this.AppPaths[$appName] = @{ ExePath = $proc.Path; Dir = [System.IO.Path]::GetDirectoryName($proc.Path) }
+            } else { $this.AppPaths[$appName]['ExePath'] = $proc.Path }
+
+            # MERGE: zachowaj moduły z poprzednich sesji (pluginy, które nie są teraz załadowane)
+            # Dzięki temu re-profil rozszerza wiedzę zamiast ją nadpisywać
+            $prevLF = if ($this.AppPaths[$appName].ContainsKey('LearnedFiles') -and
+                         $this.AppPaths[$appName].LearnedFiles -and
+                         $this.AppPaths[$appName].LearnedFiles.Count -gt 0) { $this.AppPaths[$appName].LearnedFiles } else { $null }
+            if ($prevLF) {
+                $curPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($f in $learnedFiles) { $curPaths.Add($f.Path) | Out-Null }
+                $mergeCount = 0
+                foreach ($elf in $prevLF) {
+                    if (-not $curPaths.Contains($elf.Path) -and (Test-Path $elf.Path -ErrorAction SilentlyContinue)) {
+                        $learnedFiles.Add($elf); $mergeCount++
+                    }
+                }
+                if ($mergeCount -gt 0) { Write-RCLog "PROFILE MERGE '$appName': +$mergeCount modułów z poprzednich sesji zachowanych" }
             }
+
             $this.AppPaths[$appName].LearnedFiles = $learnedFiles
             $this.AppPaths[$appName].ProfiledAt = [datetime]::Now
             $this.AppPaths[$appName].ModuleCount = $learnedFiles.Count
+
+            # CHILD PATTERN TRACKING — które child procs pojawiły się Z tą app w tej sesji
+            # Np. Reaper+vstbridge w Gaming → przy następnym Gaming preloaduj vstbridge automatycznie
+            if ($childProcNames -and $childProcNames.Count -gt 0) {
+                $cpSession = $this.CurrentSession
+                if (-not $this.AppPaths[$appName].ContainsKey('ChildPatterns')) {
+                    $this.AppPaths[$appName].ChildPatterns = @{}
+                }
+                if (-not $this.AppPaths[$appName].ChildPatterns.ContainsKey($cpSession)) {
+                    $this.AppPaths[$appName].ChildPatterns[$cpSession] = @{}
+                }
+                foreach ($cpN in $childProcNames) {
+                    if (-not $this.AppPaths[$appName].ChildPatterns[$cpSession].ContainsKey($cpN)) {
+                        $this.AppPaths[$appName].ChildPatterns[$cpSession][$cpN] = 0
+                    }
+                    $this.AppPaths[$appName].ChildPatterns[$cpSession][$cpN]++
+                }
+                Write-RCLog "CHILD PATTERN '$appName' [$cpSession]: $($childProcNames.Count) child procs śledzonych"
+            }
+
             # Log success
             $totalSizeMB = 0; foreach ($f in $learnedFiles) { $totalSizeMB += $f.Size }
             $totalSizeMB = [Math]::Round($totalSizeMB / 1MB, 1)
-            Write-RCLog "PROFILED '$appName': $($learnedFiles.Count) modules ($($totalSizeMB)MB)"
+            Write-RCLog "PROFILED '$appName': $($learnedFiles.Count) modułów ($($totalSizeMB)MB) cat=$aiPropCategory sess=$aiSessionCtx"
             $this.IsDirty = $true
             
             # DEEP PROFILE: skanuj katalog app dla asset files (shaders, pak, textures)
@@ -18139,6 +18247,32 @@ class AppRAMCache {
                 }
             } catch {}
             
+            # LATE PROFILE: jeśli app ma serwis pluginów (VST/CLAP/ASIO/ARA), zaplanuj
+            # ponowny skan za 120s — wtedy pluginy załadowane przez użytkownika są już w pamięci.
+            # $hasPlugSvc obliczone wcześniej (przed AI SORT) — nie deklarujemy ponownie.
+            if ($hasPlugSvc) {
+                # Sprawdź czy late profile był już wykonany w ciągu ostatnich 5 minut
+                # (zapobiega nieskończonej pętli: każdy profil widzi vstservice → kolejkuje → odpala → itd.)
+                $recentlyQueued = $false
+                foreach ($pq in $this.PendingProfileQueue) {
+                    if ($pq.AppName -eq $appName -and $pq.ContainsKey('IsLate')) { $recentlyQueued = $true; break }
+                }
+                if (-not $recentlyQueued) {
+                    $lastLate = if ($this.AppPaths[$appName].ContainsKey('LateProfileAt')) { $this.AppPaths[$appName]['LateProfileAt'] } else { [datetime]::MinValue }
+                    $cooldownOk = ([datetime]::Now - $lastLate).TotalMinutes -gt 5
+                    if ($cooldownOk) {
+                        $this.AppPaths[$appName]['LateProfileAt'] = [datetime]::Now
+                        $detectedSvc = ($pluginSvcNames | Where-Object { $learnedFiles.Path -contains $_ } | Select-Object -First 1)
+                        $this.PendingProfileQueue.Add(@{
+                            AppName      = $appName
+                            ProfileAfter = [datetime]::Now.AddSeconds(120)
+                            IsLate       = $true
+                        })
+                        Write-RCLog "LATE PROFILE QUEUED '$appName': re-scan za 120s (plugin service: $detectedSvc, maxMod=$maxModules) — zaladuj wtyczki teraz"
+                    }
+                }
+            }
+
             # Zapisz manifest na dysk od razu po profilowaniu (nie czekaj na LoadComplete)
             $this.SaveAppToDiskCache($appName)
         } catch {}
@@ -18186,6 +18320,15 @@ class AppRAMCache {
                             if ($v.PA) { $entry.ProfiledAt = try { [datetime]::Parse($v.PA, [System.Globalization.CultureInfo]::InvariantCulture) } catch { [datetime]::Now } }
                             $entry.ModuleCount = $lf.Count
                         }
+                        # Przywróć wzorce child procs per sesja
+                        if ($v.CP) {
+                            $cpMap = @{}
+                            $v.CP.PSObject.Properties | ForEach-Object {
+                                $sess = $_.Name; $cpMap[$sess] = @{}
+                                $_.Value.PSObject.Properties | ForEach-Object { $cpMap[$sess][$_.Name] = [int]$_.Value }
+                            }
+                            $entry.ChildPatterns = $cpMap
+                        }
                         $this.AppPaths[$appName] = $entry
                         $merged++
                     } else {
@@ -18203,6 +18346,15 @@ class AppRAMCache {
                             if ($v.PA) { $this.AppPaths[$appName].ProfiledAt = try { [datetime]::Parse($v.PA, [System.Globalization.CultureInfo]::InvariantCulture) } catch { [datetime]::Now } }
                             $this.AppPaths[$appName].ModuleCount = $lf.Count
                             $enriched++
+                        }
+                        # Przywróć ChildPatterns jeśli pamięć ich nie ma
+                        if ($v.CP -and -not $this.AppPaths[$appName].ContainsKey('ChildPatterns')) {
+                            $cpMap = @{}
+                            $v.CP.PSObject.Properties | ForEach-Object {
+                                $sess = $_.Name; $cpMap[$sess] = @{}
+                                $_.Value.PSObject.Properties | ForEach-Object { $cpMap[$sess][$_.Name] = [int]$_.Value }
+                            }
+                            $this.AppPaths[$appName].ChildPatterns = $cpMap
                         }
                     }
                 }
@@ -18317,6 +18469,10 @@ class AppRAMCache {
                         if ($entry.ContainsKey('ProfiledAt') -and $entry.ProfiledAt) {
                             $pathEntry.PA = ([datetime]$entry.ProfiledAt).ToString("o")
                         }
+                    }
+                    # Zapisz ChildPatterns — które child procs pojawiają się per sesja
+                    if ($entry.ContainsKey('ChildPatterns') -and $entry.ChildPatterns -and $entry.ChildPatterns.Count -gt 0) {
+                        $pathEntry.CP = $entry.ChildPatterns
                     }
                     $paths[$app] = $pathEntry
                 } catch { continue }
@@ -22736,14 +22892,31 @@ $Script:PreviousEnsembleEnabled = $false
                     if (-not [string]::IsNullOrWhiteSpace($currentForeground)) {
                         $appRAMCache.UpdateHeavyMode($currentForeground, $currentMetrics.CPU, $ctxGpuLoad, $prophetApps)
                     }
-                    # Profile app modules — co 30 iteracji skanuj RZECZYWISTE moduły foreground app
+                    # Profile app modules — co 30 iters gdy brak danych; co 300 iters re-scan
+                    # Re-scan wychwytuje nowe podprogramy/pluginy załadowane przez użytkownika w tej sesji
                     if ($iteration % 30 -eq 0 -and -not [string]::IsNullOrWhiteSpace($currentForeground)) {
                         $hasLearned = ($appRAMCache.AppPaths.ContainsKey($currentForeground) -and 
                                        $appRAMCache.AppPaths[$currentForeground].ContainsKey('LearnedFiles') -and 
                                        $appRAMCache.AppPaths[$currentForeground].LearnedFiles -and 
                                        $appRAMCache.AppPaths[$currentForeground].LearnedFiles.Count -gt 0)
-                        if (-not $hasLearned) {
+                        # Profil: brak danych LUB re-scan co ~10 minut (wychwytuje nowo załadowane pluginy)
+                        if (-not $hasLearned -or ($iteration % 300 -eq 0 -and $iteration -gt 0)) {
                             $appRAMCache.ProfileAppModules($currentForeground)
+                        }
+                    }
+                    # LATE PROFILE QUEUE — obsługa re-skanów odroczonych przez ProfileAppModules
+                    # (np. Studio Pro z vstservice.dll → re-profil 90s po starcie gdy pluginy są załadowane)
+                    # LaunchRaceTick obsługuje tę kolejkę podczas wyścigu startowego (~15s),
+                    # tutaj obsługujemy pozycje które nie wymagają aktywnego wyścigu.
+                    if ($appRAMCache.PendingProfileQueue.Count -gt 0 -and -not $appRAMCache.IsInLaunchRace) {
+                        $lateNow = [datetime]::Now
+                        $lateRemove = [System.Collections.Generic.List[hashtable]]::new()
+                        foreach ($lp in $appRAMCache.PendingProfileQueue) {
+                            if ($lateNow -ge $lp.ProfileAfter) { $lateRemove.Add($lp) }
+                        }
+                        foreach ($lr in $lateRemove) {
+                            $appRAMCache.PendingProfileQueue.Remove($lr) | Out-Null
+                            $appRAMCache.ProfileAppModules($lr.AppName)
                         }
                     }
                     # #8: Session detection
