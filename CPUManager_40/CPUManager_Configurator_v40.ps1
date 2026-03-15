@@ -680,6 +680,7 @@ $Script:DefaultConfig = @{
         BalancedThreshold = 38        # CPU% powyzej ktorego wlacza Balanced
         ForceSilentCPU = 20           # CPU% ponizej ktorego wymusza Silent (bylo 10)
         ForceSilentCPUInactive = 25   # CPU% dla nieaktywnego uzytkownika (bylo 15)
+        ModeHoldTime = 6              # Sekundy minimalnego czasu w trybie - debounce (domyslnie 6s)
     }
     BoostSettings = @{
         BoostDuration = 10000
@@ -4684,6 +4685,7 @@ $aiTurboThr = if ($Script:Config.AIThresholds.TurboThreshold) { $Script:Config.A
 $aiBalancedThr = if ($Script:Config.AIThresholds.BalancedThreshold) { $Script:Config.AIThresholds.BalancedThreshold } else { 38 }
 $aiForceSilent = if ($Script:Config.AIThresholds.ForceSilentCPU) { $Script:Config.AIThresholds.ForceSilentCPU } else { 20 }
 $aiForceSilentInact = if ($Script:Config.AIThresholds.ForceSilentCPUInactive) { $Script:Config.AIThresholds.ForceSilentCPUInactive } else { 25 }
+$aiModeHoldTime = if ($Script:Config.AIThresholds.ModeHoldTime) { $Script:Config.AIThresholds.ModeHoldTime } else { 6 }
 New-Label -Parent $gbAIThresholds -Text "Turbo CPU%:" -X 15 -Y 28 -Width 90 -Height 22
 $Script:numAITurboThr = New-NumericUpDown -Parent $gbAIThresholds -X 110 -Y 25 -Min 50 -Max 95 -Value $aiTurboThr -Width 60
 New-Label -Parent $gbAIThresholds -Text "Balanced CPU%:" -X 190 -Y 28 -Width 100 -Height 22
@@ -4692,10 +4694,13 @@ New-Label -Parent $gbAIThresholds -Text "Silent CPU%:" -X 15 -Y 65 -Width 90 -He
 $Script:numAIForceSilent = New-NumericUpDown -Parent $gbAIThresholds -X 110 -Y 62 -Min 5 -Max 35 -Value $aiForceSilent -Width 60
 New-Label -Parent $gbAIThresholds -Text "Silent Inactive%:" -X 190 -Y 65 -Width 100 -Height 22
 $Script:numAIForceSilentInact = New-NumericUpDown -Parent $gbAIThresholds -X 295 -Y 62 -Min 5 -Max 45 -Value $aiForceSilentInact -Width 60
+New-Label -Parent $gbAIThresholds -Text "Hold Time (s):" -X 380 -Y 65 -Width 90 -Height 22
+$Script:numAIModeHoldTime = New-NumericUpDown -Parent $gbAIThresholds -X 470 -Y 62 -Min 2 -Max 30 -Value $aiModeHoldTime -Width 60
 $toolTip.SetToolTip($Script:numAITurboThr, " CPU% powyzej ktorego AI wlacza TURBO (domyslnie 72%)")
 $toolTip.SetToolTip($Script:numAIBalancedThr, " CPU% powyzej ktorego AI wlacza BALANCED (domyslnie 38%)")
 $toolTip.SetToolTip($Script:numAIForceSilent, " CPU% ponizej ktorego AI wymusza SILENT (domyslnie 20%)")
 $toolTip.SetToolTip($Script:numAIForceSilentInact, " CPU% dla nieaktywnego uzytkownika (domyslnie 25%)")
+$toolTip.SetToolTip($Script:numAIModeHoldTime, "Czas (s) przez jaki AI trzyma tryb przed zmiana - krocej = szybsza reakcja, dluzej = stabilniejszy (domyslnie 6s)")
 New-Label -Parent $gbAIThresholds -Text "Te progi kontroluja decyzje AI o zmianie trybow" -X 15 -Y 95 -Width 500 -Height 15 -ForeColor $Script:Colors.TextDim
 $btnSaveEngines = New-Button -Parent $tabSettings -Text "SAVE AI ENGINES" -X 10 -Y 810 -Width 180 -Height 40 -BackColor $Script:Colors.Success -ForeColor $Script:Colors.Background -OnClick {
 $toolTip.SetToolTip($btnSaveEngines, "✓ Zapisuje konfiguracje systemów AI. Zmiany zastosowane natychmiast.")
@@ -5004,6 +5009,7 @@ $toolTip.SetToolTip($btnSaveSettings, " Zapisuje wszystkie ustawienia CONFIGURAT
             BalancedThreshold = [int]$Script:numAIBalancedThr.Value
             ForceSilentCPU = [int]$Script:numAIForceSilent.Value
             ForceSilentCPUInactive = [int]$Script:numAIForceSilentInact.Value
+            ModeHoldTime = [int]$Script:numAIModeHoldTime.Value
         }
         LearningSettings = @{
             BiasInfluence = if ($Script:trackBiasInfluence) { [int]$Script:trackBiasInfluence.Value } else { 25 }

@@ -2866,6 +2866,7 @@ function Get-DefaultConfigTemplate {
             ForceSilentCPUInactive = $Script:ForceSilentCPUInactive
             TurboThreshold = $Script:TurboThreshold
             BalancedThreshold = $Script:BalancedThreshold
+            ModeHoldTime = $Script:ModeHoldTime
         }
         IOSettings = @{
             ReadThreshold = $Script:IOReadThreshold
@@ -3822,6 +3823,9 @@ function Load-ExternalConfig {
             if ($null -ne $configJson.AIThresholds.BalancedThreshold) {
                 $Script:BalancedThreshold = [int]$configJson.AIThresholds.BalancedThreshold
             }
+            if ($null -ne $configJson.AIThresholds.ModeHoldTime) {
+                $Script:ModeHoldTime = [Math]::Max(2, [Math]::Min(30, [int]$configJson.AIThresholds.ModeHoldTime))
+            }
         }
         # IOSettings - Ustawienia czulosci I/O (NOWE!)
         if ($configJson.IOSettings) {
@@ -4324,6 +4328,7 @@ $Script:ForceSilentCPU = 30   # v40.3: Podwyższone z 20 — CPU <30% = ZAWSZE S
 $Script:ForceSilentCPUInactive = 25
 $Script:TurboThreshold = 72
 $Script:BalancedThreshold = 38
+$Script:ModeHoldTime = 6     # Sekund minimalnego czasu w trybie przed zmiana (debounce, konfigurowalne)
 $Script:BoostCooldown = 20  #  NEW: Domyslny cooldown miedzy Boostami (sekundy)
 # === I/O SENSITIVITY SETTINGS (z config.json) ===
 $Script:IOReadThreshold = 80      # MB/s - prog odczytu wyzwalajacy reakcje
@@ -22660,13 +22665,14 @@ $Script:PreviousEnsembleEnabled = $false
                 if (-not $Script:ModeHoldCandidate) { $Script:ModeHoldCandidate = $null }
                 
                 $modeHoldSeconds = ([DateTime]::UtcNow - $Script:ModeHoldStart).TotalSeconds
-                $modeMinHoldTime = 15  # Minimum sekund w trybie zanim zmiana
+                $modeMinHoldTime = $Script:ModeHoldTime  # Konfigurowalne (domyslnie 6s)
                 
                 if ($newMode -ne $prevMode) {
                     # Wyjątki - natychmiastowa zmiana (bez debounce):
-                    $instantChange = ($reason -match "^THERMAL|^HARDLOCK|^GAMING") -or
-                                     ($newMode -eq "Silent" -and $prevMode -eq "Turbo" -and $currentMetrics.CPU -lt 15) -or
-                                     ($newMode -eq "Turbo" -and $currentMetrics.CPU -gt 85)
+                    $instantChange = ($reason -match "^THERMAL|^HARDLOCK|^GAMING|^HEAVY") -or
+                                     ($newMode -eq "Silent" -and $currentMetrics.CPU -lt $Script:ForceSilentCPU) -or
+                                     ($newMode -eq "Turbo"  -and $currentMetrics.CPU -ge $turboEntryThreshold) -or
+                                     ($newMode -eq "Silent" -and $prevMode -eq "Turbo" -and $currentMetrics.CPU -lt 25)
                     
                     if ($instantChange) {
                         # Krytyczne - zmień natychmiast
@@ -22684,8 +22690,8 @@ $Script:PreviousEnsembleEnabled = $false
                             $Script:ModeHoldConfirmCount = 1
                         }
                         
-                        # Jeśli 4+ potwierdzenia tego samego trybu - pozwól zmienić wcześniej
-                        if ($Script:ModeHoldConfirmCount -ge 4) {
+                        # Jeśli 3+ potwierdzenia tego samego trybu - pozwól zmienić wcześniej
+                        if ($Script:ModeHoldConfirmCount -ge 3) {
                             $Script:ModeHoldStart = [DateTime]::UtcNow
                             $Script:ModeHoldConfirmCount = 0
                             $Script:ModeHoldCandidate = $null
@@ -22709,10 +22715,11 @@ $Script:PreviousEnsembleEnabled = $false
                 if (-not $Script:LastModeChangeTime) { $Script:LastModeChangeTime = [datetime]::MinValue }
                 if ($newMode -ne $prevMode) {
                     $holdElapsed = ((Get-Date) - $Script:LastModeChangeTime).TotalSeconds
-                    $isSafetyOverride = ($reason -match "THERMAL|HARDLOCK|GPU-BOUND|PAUSED|ForceMode")
-                    if ($holdElapsed -lt 20 -and -not $isSafetyOverride) {
+                    $isSafetyOverride = ($reason -match "THERMAL|HARDLOCK|GPU-BOUND|PAUSED|ForceMode|HEAVY I/O|CONFIRMED")
+                    $globalHoldSecs = [Math]::Max(4, [int]($Script:ModeHoldTime * 0.8))
+                    if ($holdElapsed -lt $globalHoldSecs -and -not $isSafetyOverride) {
                         $newMode = $prevMode
-                        $reason = "HOLD-MIN-TIME: $([int]$holdElapsed)/20s (blocked: $reason)"
+                        $reason = "HOLD-MIN-TIME: $([int]$holdElapsed)/$($globalHoldSecs)s (blocked: $reason)"
                     } else {
                         $Script:LastModeChangeTime = Get-Date
                     }
