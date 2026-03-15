@@ -21009,6 +21009,11 @@ $Script:PreviousEnsembleEnabled = $false
                         }
                     }
                 }
+                # Sync AICoordinator enabled flags z $Script:AIEngines (zawsze, nie tylko przy zmianie)
+                if ($aiCoordinator) {
+                    $aiCoordinator.SetEnsembleEnabled((Is-EnsembleEnabled))
+                    $aiCoordinator.SetNeuralBrainEnabled((Is-NeuralBrainEnabled))
+                }
                 # Sprawdz czy zmieniono typ CPU
                 if (Test-Path $Script:CPUConfigPath) {
                     try {
@@ -22283,6 +22288,19 @@ $Script:PreviousEnsembleEnabled = $false
                         }
                     } catch {}
                 }
+                # Ensemble Vote: gdy włączony, głosuje na tryb i dodaje score do modelScores
+                # Bez tego wywołania ensemble.Vote() silnik Ensemble nie ma żadnego wpływu na $newMode
+                if ($ensemble -and (Is-EnsembleEnabled)) {
+                    try {
+                        $ensembleDecisions = @{}
+                        foreach ($engKey in $modelScores.Keys) {
+                            $s = $modelScores[$engKey]
+                            $ensembleDecisions[$engKey] = if ($s -gt 70) { "Turbo" } elseif ($s -lt 35) { "Silent" } else { "Balanced" }
+                        }
+                        $ensembleVote = $ensemble.Vote($ensembleDecisions, $ramUsage, $ramSpike)
+                        $modelScores["Ensemble"] = switch ($ensembleVote) { "Turbo" { 82 } "Silent" { 22 } default { 50 } }
+                    } catch {}
+                }
                 $modelWeights = @{
                     "Context" = $contextWeight  # Dynamiczne wagi
                     "PowerBoost" = if ($Script:PowerBoost) { 1.5 } else { 0.5 }  # V38: Higher weight when enabled
@@ -22590,6 +22608,11 @@ $Script:PreviousEnsembleEnabled = $false
                 # v42.6 FIX BUG #4: SelfTuner - zapisuj decyzje do późniejszej ewaluacji
                 if ($selfTuner -and (Is-SelfTunerEnabled)) {
                     $selfTuner.RecordDecision($newMode, $currentMetrics.CPU, $currentMetrics.Temp, $aiDecision.Score, $ioTotal)
+                }
+                
+                # Brain Evolve feedback - ucz AggressionBias z finalnej decyzji AI (tylko przy zmianie trybu)
+                if ($brain -and (Is-NeuralBrainEnabled) -and $newMode -ne $prevMode) {
+                    $brain.Evolve($newMode)
                 }
                 
                 # v40.2 FIX: Bandit feedback - ocen czy wybrany arm był trafny
