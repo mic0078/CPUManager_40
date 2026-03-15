@@ -8495,8 +8495,8 @@ class ContextDetector {
                 $detectedContext = "Work"
                 $highestPriority = 4
             }
-            # CPU>25% = aktywna praca
-            elseif ($cpu -gt 25) {
+            # CPU>40% = aktywna praca (25-40% to szara strefa - mogą to być procesy tła przy Idle)
+            elseif ($cpu -gt 40) {
                 $detectedContext = "Work"
                 $highestPriority = 5
             }
@@ -12806,6 +12806,13 @@ class AICoordinator {
             # Zapobiega: Phase=Cutscene(score=30) + GPU=100% → Silent (throttle/stutter)
             if ($gpu -gt 70 -and $phaseScore -lt 50) {
                 $modelScores["Phase"] = 50  # Minimum Balanced gdy GPU aktywny
+            }
+            # DESKTOP IDLE FIX: gdy foreground=Desktop i użytkownik nieaktywny,
+            # faza "Active" (score=70) pochodzi od procesów tła Windows (Defender, OneDrive itp.),
+            # a nie od faktycznej pracy użytkownika → obniż score do 35 (nie blokuje Silent)
+            if (($foregroundApp -eq 'Desktop' -or $foregroundApp -eq 'explorer') -and
+                $phaseScore -gt 35 -and (-not $Script:UserIsActive)) {
+                $modelScores["Phase"] = 35  # Procesy tła nie potrzebują wydajności CPU
             }
         }
         
@@ -21874,12 +21881,8 @@ $Script:PreviousEnsembleEnabled = $false
             
             $isUserActive = Update-ActivityStatus
             [void]$userPatterns.RecordSample($currentMetrics.CPU, $currentMetrics.Temp, $currentContext, $currentState, $isUserActive)
-            # WYMUSZENIE TRYBU SILENT W IDLE
-            if ($currentContext -eq "Idle" -and -not $isUserActive -and -not $watcher.IsBoosting) {
-                Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU
-                $currentState = "Silent"
-                $aiDecision = @{ Score = 0; Mode = "Silent"; Reason = "Wymuszone Idle"; Trend = 0 }
-            }
+            # UWAGA: Wymuszenie Silent w Idle przeniesiono na koniec pętli (po decyzji AI)
+            # Poprzednia wersja tutaj była nadpisywana przez reset $aiDecision/$currentState = "Balanced"
             # Oblicz dynamiczny interwal
             $dynamicInterval = $adaptiveTimer.CalculateInterval($currentContext, $isUserActive, $watcher.IsBoosting, $currentMetrics.CPU)
             [void]$loadPredictor.RecordSample($currentMetrics.CPU, $currentMetrics.IO)
@@ -23080,6 +23083,21 @@ $Script:PreviousEnsembleEnabled = $false
             if ($currentContext -eq "Audio" -and $currentState -eq "Silent" -and -not $Script:SilentLockMode -and -not $Script:UserForcedMode) {
                 $currentState = "Balanced"
                 if ($aiDecision) { $aiDecision.Reason = "AUDIO-SAFE: min Balanced (dropout prevention)" }
+            }
+            # IDLE FORCE SILENT - finalny override po decyzji AI
+            # Naprawia: procesy tła Windows (Phase=Active CPU=25-40%) wybijają PC z Silent
+            # Warunki: użytkownik nieaktywny + CPU poniżej progu + brak boost/hardlock
+            if (-not $isUserActive `
+                -and $currentMetrics.CPU -lt $Script:ForceSilentCPU `
+                -and (-not $watcher.IsBoosting) `
+                -and ($null -eq $startupBoostEntry) `
+                -and (-not $hardLockBlocked) `
+                -and (-not $Script:UserForcedMode -or $Script:UserForcedMode -eq "")) {
+                if ($currentState -ne "Silent") {
+                    Add-Log "IDLE→Silent: $currentState nadpisane (CPU=$([int]$currentMetrics.CPU)%<$($Script:ForceSilentCPU)%, nieaktywny)"
+                    if ($aiDecision) { $aiDecision.Reason = "IDLE-FORCE: CPU=$([int]$currentMetrics.CPU)%<$($Script:ForceSilentCPU)%, inactive" }
+                }
+                $currentState = "Silent"
             }
             # v43.14: HardLock flag → wyłącza dynamiczne skalowanie (strict Min/Max)
             $isHardLocked = $hardLockBlocked -or $Script:SilentLockMode -or $Script:BalancedLockMode -or ($Script:UserForcedMode -and $Script:UserForcedMode -ne "")
