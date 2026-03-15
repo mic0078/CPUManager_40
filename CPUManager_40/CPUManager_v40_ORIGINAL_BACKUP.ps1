@@ -1,4 +1,4 @@
-﻿# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # CPUManager ENGINE v43.9 - AI KNOWLEDGE TRANSFER (FIXED)
 # © 2026 Michał | v43.9: 2026-02-02
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -20274,16 +20274,16 @@ function Render-UI {
         $UserPatternStatus = "", $TimerStatus = "2Hz",
         $GPUInfo = $null, $VRMTemp = 0, $CPUPower = 0, $ExplainerReason = ""
     )
-    # FIX: Instead of Clear-Host use SetCursorPosition - eliminates flickering
+    # FIX: Zamiast Clear-Host używamy SetCursorPosition - eliminuje migotanie
     try { [Console]::SetCursorPosition(0, 0) } catch { Clear-Host }
-    # Get console width for padding line endings
+    # Pobierz wymiary konsoli dla czyszczenia końcówek linii
     $consoleWidth = try { [Console]::WindowWidth - 1 } catch { 120 }
     $lines = [System.Collections.Generic.List[string]]::new()
     $aiStatus = if ($Global:AI_Active) { "- AI ON" } else { "- MANUAL" }
     $debugStatus = if ($Global:DebugMode) { " [DEBUG]" } else { "" }
     $lines.Add(" [STATUS AI] $aiStatus$debugStatus | Sessions: $($Prophet.TotalSessions) | Time: $((Get-Date).ToString('HH:mm'))")
     $lines.Add("")
-    $icon = switch($State) { "Turbo" { "^^" } "Balanced" { "==" } "Silent" { ".." } default { "??" } }
+    $icon = switch($State) { "Turbo" { "" } "Balanced" { "?" } "Silent" { "?" } default { "?" } }
     $powerInfo = if ($Script:LastPowerMax -gt 0) { " [Max:$($Script:LastPowerMax)%]" } else { "" }
     $lines.Add(" [POWER STATE] $icon $State$powerInfo - $($AIDecision.Reason)")
     $lines.Add("")
@@ -20295,7 +20295,7 @@ function Render-UI {
     $cpuPowerStr = if ($CPUPower -gt 0) { " ${CPUPower}W" } else { "" }
     $sensorsParts = @()
     if ($null -eq $Metrics.CPU) {
-        $sensorsParts += ("CPU: N/A$cpuPowerStr (no data)")
+        $sensorsParts += ("CPU: N/A$cpuPowerStr (brak danych)")
     } else {
         $sensorsParts += ("CPU: $($Metrics.CPU)%$cpuPowerStr")
     }
@@ -20306,17 +20306,17 @@ function Render-UI {
     } elseif ($GPUInfo -and $GPUInfo.Temp -gt 0) {
         $sensorsParts += ("GPU: iGPU $($GPUInfo.Temp)°C")
     }
-    $trendIcon = if ($AIDecision.Trend -gt 3) { '^^' }
-                 elseif ($AIDecision.Trend -gt 0) { '^' }
-                 elseif ($AIDecision.Trend -lt -3) { 'vv' }
-                 elseif ($AIDecision.Trend -lt 0) { 'v' }
+    $trendIcon = if ($AIDecision.Trend -gt 3) { '??' }
+                 elseif ($AIDecision.Trend -gt 0) { '?' }
+                 elseif ($AIDecision.Trend -lt -3) { '??' }
+                 elseif ($AIDecision.Trend -lt 0) { '?' }
                  else { '->' }
     $tempDisplay = if ($Metrics.Temp -gt 0) { "$($Metrics.Temp)°C" } else { "N/A" }
     $tempSourceShort = switch ($TempSource) {
         "LibreHardwareMonitor" { "LHM" }
         "OpenHardwareMonitor" { "OHM" }
         "WMI-ACPI" { "ACPI" }
-        default { "UNK" }
+        default { "?" }
     }
     $vrmStr = if ($VRMTemp -gt 0) { " VRM: ${VRMTemp}°C" } else { "" }
     $sensorsParts += ("I/O: $($Metrics.IO) MB/s")
@@ -20328,11 +20328,11 @@ function Render-UI {
         $pressureBar = Draw-ProgressBar -Value ([Math]::Min(100, $AIDecision.Score))
         $lines.Add(" [AI ENGINE]")
         $lines.Add("   Pressure: [$pressureBar] $($AIDecision.Score)")
-        # FIX: Total Decisions = sum from ALL AI engines (not just Neural Brain)
+        #  FIX: Total Decisions = suma ze WSZYSTKICH silnikow AI (nie tylko Neural Brain)
         $totalDecisions = $qLearning.TotalUpdates + $bandit.TotalPulls + $genetic.Generation + 
                           $selfTuner.DecisionHistory.Count + $chainPredictor.TotalPredictions + 
                           $Prophet.GetAppCount() + $Brain.TotalDecisions
-        # Bias: If Neural Brain active, show its bias, otherwise "N/A"
+        # Bias: Jesli Neural Brain aktywny, pokaz jego bias, w przeciwnym razie "N/A"
         $biasDisplay = if ($Brain.TotalDecisions -gt 0) { 
             [Math]::Round($Brain.AggressionBias, 2) 
         } else { 
@@ -20366,7 +20366,7 @@ function Render-UI {
     # Context & Thermal
     $lines.Add("    Context: $ContextStatus | - $ThermalStatus")
     # Activity & Timer
-    $activityIcon = if ($ActivityStatus -eq "Active") { "[*]" } else { "[ ]" }
+    $activityIcon = if ($ActivityStatus -eq "Active") { "?" } else { "?" }
     $lines.Add("   $activityIcon User: $ActivityStatus |  Rate: $TimerStatus |  Patterns: $UserPatternStatus")
     # Explainer Reason
     if (-not [string]::IsNullOrWhiteSpace($ExplainerReason)) {
@@ -20374,6 +20374,7 @@ function Render-UI {
     }
     $lines.Add("")
     $lines.Add(" [LEARNED]")
+    # Tutaj mozesz dodac wlasny komunikat, np.:
     $lines.Add("    Learned applications are listed here.")
     if ($Watcher.IsBoosting) {
         $lines.Add("    BOOSTING: $($Watcher.BoostDisplayName) [$($Watcher.GetBoostRemainingSeconds())s]")
