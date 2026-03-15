@@ -9675,37 +9675,41 @@ class AdaptiveTimer {
             $targetInterval = $this.MinInterval  # Boosting = najszybciej
         }
         elseif ($context -eq "Audio") {
-            $targetInterval = 250  # - AUDIO/DAW = najszybsza reakcja dla MIDI!
+            $targetInterval = 250  # AUDIO/DAW = najszybsza reakcja dla MIDI!
         }
         elseif ($context -eq "Gaming") {
-            $targetInterval = 500  #  FIXED: Gaming = bardzo szybko (bylo 750)
+            $targetInterval = 250  # GAMING = maksymalna responsywnosc jak Windows (bylo 500)
         }
         elseif ($context -eq "Rendering" -or $cpu -gt 70) {
-            $targetInterval = 700  #  FIXED: Wysokie obciazenie (bylo 1000)
+            $targetInterval = 400  # Wysokie obciazenie - szybka reakcja (bylo 700)
         }
         elseif ($isActive) {
-            $targetInterval = 1000  #  FIXED: Aktywny uzytkownik (bylo 1500)
+            $targetInterval = 800   # Aktywny uzytkownik (bylo 1000)
         }
         elseif ($context -eq "Idle" -and -not $isActive) {
             $targetInterval = $this.MaxInterval  # Idle = oszczedzaj
         }
         else {
-            $targetInterval = 1500  #  FIXED: Domyslnie (bylo 2000)
+            $targetInterval = 1200  # Domyslnie (bylo 1500)
         }
-        # Plynne przejscie (nie skacz natychmiast)
-        if ($targetInterval -lt $this.CurrentInterval) {
-            # Szybciej zwalniamy (responsywnosc) -  FIXED: szybsze przejscie
-            $this.CurrentInterval = [Math]::Max($targetInterval, $this.CurrentInterval - 300)
-        } else {
-            # Wolniej przyspieszamy (stabilnosc)
-            $this.CurrentInterval = [Math]::Min($targetInterval, $this.CurrentInterval + 150)
-        }
-        # Sprawdz stabilnosc kontekstu
+        # Sprawdz zmiane kontekstu PRZED obliczeniem przesuniecia
+        $contextChanged = ($context -ne $this.LastContext)
         if ($context -eq $this.LastContext) {
             $this.StableCount++
         } else {
             $this.StableCount = 0
             $this.LastContext = $context
+        }
+        # NATYCHMIASTOWY skok gdy kontekst sie zmienil, boosting, lub CPU wysokie (>60%)
+        # Reaguj tak szybko jak Windows - bez stopniowego przyspieszania
+        if ($contextChanged -or $isBoosting -or $cpu -gt 60) {
+            $this.CurrentInterval = $targetInterval
+        } elseif ($targetInterval -lt $this.CurrentInterval) {
+            # Szybkie przyspieszanie (responsywnosc) - krok 400ms
+            $this.CurrentInterval = [Math]::Max($targetInterval, $this.CurrentInterval - 400)
+        } else {
+            # Wolniejsze zwalnianie (stabilnosc)
+            $this.CurrentInterval = [Math]::Min($targetInterval, $this.CurrentInterval + 150)
         }
         return $this.CurrentInterval
     }
@@ -20187,7 +20191,7 @@ function Main {
         $Script:MetricsLock = New-Object System.Object
         $Script:LatestMetrics = $metrics.GetExtended()
         $Script:MetricsTimer = New-Object System.Windows.Forms.Timer
-        $Script:MetricsTimer.Interval = 1000
+        $Script:MetricsTimer.Interval = 500  # v40.4: Skrocono z 1000ms - swiezsze dane dla petli
         $Script:MetricsTimer.Add_Tick({
             try {
                 # V40.3 FIX: Użyj GetExtended() zamiast Get() żeby mieć GPU data!
@@ -20204,7 +20208,7 @@ function Main {
         try { Add-Log "Metrics timer started (UI thread)" } catch { }
         # Background sensor poller (runs on ThreadPool thread) - offloads heavy WMI/Get-CimInstance calls
         try {
-            if (-not $Script:SensorPollMs) { $Script:SensorPollMs = 1500 }
+            if (-not $Script:SensorPollMs) { $Script:SensorPollMs = 800 }  # v40.4: Skrocono z 1500ms
             if (-not $Script:SensorErrorCount) { $Script:SensorErrorCount = 0 }
             $Script:SensorTimer = New-Object System.Timers.Timer($Script:SensorPollMs)
             $Script:SensorTimer.AutoReset = $true
@@ -21446,6 +21450,11 @@ $Script:PreviousEnsembleEnabled = $false
             [void]$loadPredictor.RecordSample($currentMetrics.CPU, $currentMetrics.IO)
             $cpuSpike = [Math]::Max(0, $currentMetrics.CPU - $Script:LastCPU)
             $Script:LastCPU = [int][Math]::Round($currentMetrics.CPU)
+            # v40.4: SPIKE OVERRIDE - gwaltowny skok CPU (>25pp) wymusza natychmiastowe krotkie okno
+            # Reaguje jak Windows scheduler - nie czeka na nastepny cykl AdaptiveTimer
+            if ($cpuSpike -gt 25 -and $dynamicInterval -gt 300 -and -not ($currentContext -eq "Idle" -and -not $isUserActive)) {
+                $dynamicInterval = 200
+            }
             if ($iteration - $lastPrediction -ge 30) {
                 $lastPrediction = $iteration
                 $predictedLoad = $loadPredictor.PredictNextMinute()
