@@ -2489,7 +2489,7 @@ function Load-TrayAIEngines {
     if (Test-Path $Script:TrayAIEnginesFile) {
         try { return Get-Content $Script:TrayAIEnginesFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch {}
     }
-    return @{ QLearning=$true; Ensemble=$false; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true }
+    return @{ QLearning=$false; Ensemble=$true; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true }
 }
 function Save-TrayAIEngines {
     param($Engines)
@@ -2611,10 +2611,10 @@ $trayEngines.Text = "Silniki AI"
 $trayEnableAll = New-Object System.Windows.Forms.ToolStripMenuItem
 $trayEnableAll.Text = "Wlacz CORE"
 $trayEnableAll.Add_Click({
-    $all = @{ QLearning=$true; Ensemble=$false; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true }
+    $all = @{ QLearning=$false; Ensemble=$true; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true }
     Save-TrayAIEngines $all | Out-Null
-    $Script:TrayEngineItems['QLearning'].Checked = $true
-    $Script:TrayEngineItems['Ensemble'].Checked = $false
+    $Script:TrayEngineItems['QLearning'].Checked = $false
+    $Script:TrayEngineItems['Ensemble'].Checked = $true
     $Script:TrayEngineItems['Prophet'].Checked = $true
     $Script:TrayEngineItems['NeuralBrain'].Checked = $false
     $Script:TrayEngineItems['AnomalyDetector'].Checked = $true
@@ -2832,16 +2832,16 @@ function Get-DefaultConfigTemplate {
     return @{
         ForceMode = ""
         PowerModes = @{
-            Silent   = @{ Min = 50;  Max = 85  }
-            Balanced = @{ Min = 70;  Max = 99  }
-            Turbo    = @{ Min = 85;  Max = 100 }
-            Extreme  = @{ Min = 100; Max = 100 }
+            Silent   = @{ Min = 35;  Max = 75  }
+            Balanced = @{ Min = 55;  Max = 92  }
+            Turbo    = @{ Min = 80;  Max = 100 }
+            Extreme  = @{ Min = 95;  Max = 100 }
         }
         PowerModesIntel = @{
-            Silent   = @{ Min = 50;  Max = 85  }
-            Balanced = @{ Min = 85;  Max = 99  }
-            Turbo    = @{ Min = 99;  Max = 100 }
-            Extreme  = @{ Min = 100; Max = 100 }
+            Silent   = @{ Min = 35;  Max = 75  }
+            Balanced = @{ Min = 55;  Max = 92  }
+            Turbo    = @{ Min = 80;  Max = 100 }
+            Extreme  = @{ Min = 95;  Max = 100 }
         }
         BoostSettings = @{
             BoostDuration = $Script:BoostDuration
@@ -3001,19 +3001,19 @@ $Script:AIEnginesPath = Join-Path $Script:ConfigDir "AIEngines.json"
 $Script:LastAIEnginesCheck = [DateTime]::Now
 $Script:AIEnginesCheckInterval = 10  #  PERFORMANCE: Zmieniono z 3s na 10s (wystarczajaco czesto)
 $Script:DefaultAIEngines = @{
-    # CORE - zawsze ON (zalecane)
-    QLearning = $true
+    # CORE - AI-first (stabilne i lekkie)
+    QLearning = $false
     Prophet = $true
     AnomalyDetector = $true
     SelfTuner = $true
-    # ADVANCED - opcjonalne
+    # ADVANCED - wlaczone na starcie dla lepszej decyzyjnosci
     ChainPredictor = $true
     LoadPredictor = $true
     Bandit = $true           # v42.6: Dodano
     Genetic = $true          # v42.6: Dodano
     Energy = $true           # v42.6: Dodano
-    # HEAVY - domyslnie OFF (wysokie zuzycie CPU)
-    Ensemble = $false
+    # HEAVY - pozostaw Neural OFF, Ensemble ON
+    Ensemble = $true
     NeuralBrain = $false
 }
 $Script:AIEngines = $Script:DefaultAIEngines.Clone()
@@ -3026,8 +3026,8 @@ function Load-AIEnginesConfig {
         try {
             $json = Get-Content $Script:AIEnginesPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $Script:AIEngines = @{
-                QLearning = if ($null -ne $json.QLearning) { $json.QLearning } else { $true }
-                Ensemble = if ($null -ne $json.Ensemble) { $json.Ensemble } else { $false }
+                QLearning = if ($null -ne $json.QLearning) { $json.QLearning } else { $false }
+                Ensemble = if ($null -ne $json.Ensemble) { $json.Ensemble } else { $true }
                 Prophet = if ($null -ne $json.Prophet) { $json.Prophet } else { $true }
                 NeuralBrain = if ($null -ne $json.NeuralBrain) { $json.NeuralBrain } else { $false }
                 AnomalyDetector = if ($null -ne $json.AnomalyDetector) { $json.AnomalyDetector } else { $true }
@@ -3655,17 +3655,18 @@ function Load-ExternalConfig {
         if (-not $configJson.PowerModes) {
             Add-Log "CONFIG MIGRATION: Old config.json detected - adding PowerModes defaults"
             $configJson | Add-Member -NotePropertyName "PowerModes" -NotePropertyValue @{
-                Silent = @{ Min = 50; Max = 85 }; Balanced = @{ Min = 70; Max = 99 }
-                Turbo = @{ Min = 85; Max = 100 }; Extreme = @{ Min = 100; Max = 100 }
+                Silent = @{ Min = 35; Max = 75 }; Balanced = @{ Min = 55; Max = 92 }
+                Turbo = @{ Min = 80; Max = 100 }; Extreme = @{ Min = 95; Max = 100 }
             } -Force
             $configJson | Add-Member -NotePropertyName "PowerModesIntel" -NotePropertyValue @{
-                Silent = @{ Min = 50; Max = 85 }; Balanced = @{ Min = 85; Max = 99 }
-                Turbo = @{ Min = 99; Max = 100 }; Extreme = @{ Min = 100; Max = 100 }
+                Silent = @{ Min = 35; Max = 75 }; Balanced = @{ Min = 55; Max = 92 }
+                Turbo = @{ Min = 80; Max = 100 }; Extreme = @{ Min = 95; Max = 100 }
             } -Force
             if (-not $configJson.PSObject.Properties.Name.Contains("AIThresholds")) {
                 $configJson | Add-Member -NotePropertyName "AIThresholds" -NotePropertyValue @{
-                    TurboThreshold = 72; BalancedThreshold = 35
-                    ForceSilentCPU = 15; ForceSilentCPUInactive = 20
+                    TurboThreshold = 80; BalancedThreshold = 40
+                    ForceSilentCPU = 20; ForceSilentCPUInactive = 20
+                    ModeHoldTime = 10
                 } -Force
             }
             if (-not $configJson.PSObject.Properties.Name.Contains("CPUAgressiveness")) {
@@ -3675,7 +3676,13 @@ function Load-ExternalConfig {
             }
             if (-not $configJson.PSObject.Properties.Name.Contains("BoostSettings")) {
                 $configJson | Add-Member -NotePropertyName "BoostSettings" -NotePropertyValue @{
-                    BoostDuration = 8; BoostCooldown = 30; AppLaunchSensitivity = "Medium"
+                    BoostDuration = 3500
+                    BoostCooldown = 20
+                    AppLaunchSensitivity = @{ CPUDelta = 12; CPUThreshold = 22 }
+                    AutoBoostEnabled = $true
+                    AutoBoostSampleMs = 350
+                    EnableBoostForAllAppsOnStart = $true
+                    StartupBoostDurationSeconds = 3
                 } -Force
             }
             # Zapisz migrowany config
@@ -4324,19 +4331,19 @@ $Script:DefaultTimerInterval = 1000
 $Script:MinTimerInterval = 400
 $Script:MaxTimerInterval = 2500
 $Script:GamingTimerInterval = 500
-$Script:ForceSilentCPU = 30   # v40.3: Podwyższone z 20 — CPU <30% = ZAWSZE Silent (mniej przełączania, ciszej)
-$Script:ForceSilentCPUInactive = 25
-$Script:TurboThreshold = 72
-$Script:BalancedThreshold = 38
-$Script:ModeHoldTime = 6     # Sekund minimalnego czasu w trybie przed zmiana (debounce, konfigurowalne)
+$Script:ForceSilentCPU = 20
+$Script:ForceSilentCPUInactive = 20
+$Script:TurboThreshold = 80
+$Script:BalancedThreshold = 40
+$Script:ModeHoldTime = 10     # Sekund minimalnego czasu w trybie przed zmiana (debounce, konfigurowalne)
 $Script:BoostCooldown = 20  #  NEW: Domyslny cooldown miedzy Boostami (sekundy)
 # === I/O SENSITIVITY SETTINGS (z config.json) ===
-$Script:IOReadThreshold = 80      # MB/s - prog odczytu wyzwalajacy reakcje
-$Script:IOWriteThreshold = 50     # MB/s - prog zapisu wyzwalajacy reakcje  
-$Script:IOSensitivity = 4         # 1-10 skala czulosci (1=niska, 10=bardzo wysoka)
+$Script:IOReadThreshold = 30      # MB/s - prog odczytu wyzwalajacy reakcje
+$Script:IOWriteThreshold = 20     # MB/s - prog zapisu wyzwalajacy reakcje  
+$Script:IOSensitivity = 10        # 1-10 skala czulosci (1=niska, 10=bardzo wysoka)
 $Script:IOCheckInterval = 1200    # ms - interwal sprawdzania aktywnosci I/O
-$Script:IOTurboThreshold = 150    # MB/s - prog I/O dla wymuszenia Turbo
-$Script:IOOverrideForceMode = $false  # Czy I/O moze nadpisac ForceMode
+$Script:IOTurboThreshold = 50     # MB/s - prog I/O dla wymuszenia Turbo
+$Script:IOOverrideForceMode = $true  # Czy I/O moze nadpisac ForceMode
 $Script:LastIOCheck = [DateTime]::Now
 $Script:IOBoostActive = $false
 $Script:IOBoostStartTime = [DateTime]::MinValue
@@ -4610,16 +4617,16 @@ $Script:BlacklistSet = [System.Collections.Generic.HashSet[string]]::new(
 )
 # === STANY MOCY DLA PROCESOROW ===
 $Script:RyzenStates = @{
-    Silent   = @{ Min=50;   Max=85  }   # AMD: Cichy tryb (responsywny, wentylator cicho)
-    Balanced = @{ Min=70;   Max=99  }   # AMD: Praca biurowa, kodowanie (stabilne Balanced)
-    Turbo    = @{ Min=85;   Max=100 }   # AMD: Gaming, kompilacja (agresywny Turbo)
-    Extreme  = @{ Min=100;  Max=100 }   # AMD: Benchmark, rendering (pelna moc)
+    Silent   = @{ Min=35;   Max=75  }   # AMD: Cichy i stabilny
+    Balanced = @{ Min=55;   Max=92  }   # AMD: Domyslny baseline AI-first
+    Turbo    = @{ Min=80;   Max=100 }   # AMD: Burst wydajnosci
+    Extreme  = @{ Min=95;   Max=100 }   # AMD: Maks wydajnosci
 }
 $Script:IntelStates = @{
-    Silent   = @{ Min=50;   Max=50  }   # Intel: Cichy tryb — 50%=1.3GHz bazowa, NIE pozwalaj na skoki wyżej
-    Balanced = @{ Min=50;   Max=99  }   # Intel: Praca biurowa — od bazy do prawie max, Windows sam reguluje
-    Turbo    = @{ Min=99;   Max=100 }   # Intel: Gaming, kompilacja (pelna moc)
-    Extreme  = @{ Min=100;  Max=100 }   # Intel: Benchmark, rendering (max staly)
+    Silent   = @{ Min=35;   Max=75  }   # Intel: Cichy i stabilny
+    Balanced = @{ Min=55;   Max=92  }   # Intel: Domyslny baseline AI-first
+    Turbo    = @{ Min=80;   Max=100 }   # Intel: Burst wydajnosci
+    Extreme  = @{ Min=95;   Max=100 }   # Intel: Maks wydajnosci
 }
 # ================== AI ENGINES CONTROL (Ensemble/NeuralBrain) =====================
 # Sciezki do plikow danych silnikow
@@ -4686,7 +4693,7 @@ function Get-PowerStates {
 # BOOST TURBO Tracking
 $Script:BoostActive = $false
 $Script:BoostStartTime = 0
-$Script:BoostDuration = 10000
+$Script:BoostDuration = 3500
 $Script:LastCPU = 0
 $Script:LastProcessCount = 0
 $Script:AutoBoostEnabled = $true

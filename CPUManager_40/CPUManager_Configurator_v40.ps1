@@ -544,7 +544,7 @@ function Send-ReloadSignal {
         }
     } catch { 
         # Fallback - reset throttle on error
-        $Script:LastReloadSignalTime = [datetime]::MinValue
+        $Script:LastReloadSignal = [datetime]::MinValue
         try {
             # Ultimate fallback - direct write
             $signal | ConvertTo-Json -Compress | Set-Content $Script:ReloadSignalPath -Encoding UTF8 -Force
@@ -662,28 +662,28 @@ $Script:DefaultConfig = @{
     ForceMode = ""
     #  SYNC v40: PowerModes dla AMD (RyzenStates) - zsynchronizowane z ENGINE
     PowerModes = @{
-        Silent   = @{ Min = 50;  Max = 85  }   # AMD: Cichy ale responsywny
-        Balanced = @{ Min = 70;  Max = 99  }   # AMD: Stabilne Balanced
-        Turbo    = @{ Min = 85;  Max = 100 }   # AMD: Agresywny Turbo
-        Extreme  = @{ Min = 100; Max = 100 }   # AMD: Pelna moc
+        Silent   = @{ Min = 35;  Max = 75  }   # AI-first: cicho i stabilnie
+        Balanced = @{ Min = 55;  Max = 92  }   # AI-first: domyslny tryb pracy
+        Turbo    = @{ Min = 80;  Max = 100 }   # AI-first: szybki burst
+        Extreme  = @{ Min = 95;  Max = 100 }   # AI-first: maks wydajnosci
     }
     #  SYNC v40: PowerModes dla Intel (IntelStates) - zsynchronizowane z ENGINE
     PowerModesIntel = @{
-        Silent   = @{ Min = 50;  Max = 85  }   # Intel: Cichy tryb (responsywny)
-        Balanced = @{ Min = 85;  Max = 99  }   # Intel: Praca biurowa (wysoka responsywnosc)
-        Turbo    = @{ Min = 99;  Max = 100 }   # Intel: Gaming, kompilacja (pelna moc)
-        Extreme  = @{ Min = 100; Max = 100 }   # Intel: Benchmark, rendering (max staly)
+        Silent   = @{ Min = 35;  Max = 75  }   # Intel: cichy i stabilny
+        Balanced = @{ Min = 55;  Max = 92  }   # Intel: bezpieczny baseline
+        Turbo    = @{ Min = 80;  Max = 100 }   # Intel: mocny burst
+        Extreme  = @{ Min = 95;  Max = 100 }   # Intel: maks wydajnosci
     }
     #  SYNC v40: AIThresholds - zsynchronizowane z ENGINE (poprawki efektywności energetycznej)
     AIThresholds = @{
-        TurboThreshold = 72           # CPU% powyzej ktorego wlacza Turbo
-        BalancedThreshold = 38        # CPU% powyzej ktorego wlacza Balanced
-        ForceSilentCPU = 20           # CPU% ponizej ktorego wymusza Silent (bylo 10)
-        ForceSilentCPUInactive = 25   # CPU% dla nieaktywnego uzytkownika (bylo 15)
-        ModeHoldTime = 6              # Sekundy minimalnego czasu w trybie - debounce (domyslnie 6s)
+        TurboThreshold = 80           # CPU% powyzej ktorego wlacza Turbo
+        BalancedThreshold = 40        # CPU% powyzej ktorego wlacza Balanced
+        ForceSilentCPU = 20           # CPU% ponizej ktorego wymusza Silent
+        ForceSilentCPUInactive = 20   # CPU% dla nieaktywnego uzytkownika
+        ModeHoldTime = 10             # Sekundy minimalnego czasu w trybie - debounce
     }
     BoostSettings = @{
-        BoostDuration = 10000
+        BoostDuration = 3500
         BoostCooldown = 20
         AppLaunchSensitivity = @{ CPUDelta = 12; CPUThreshold = 22 }
         AutoBoostEnabled = $true
@@ -692,9 +692,9 @@ $Script:DefaultConfig = @{
         StartupBoostDurationSeconds = 3
     }
     IOSettings = @{
-        ReadThreshold = 80; WriteThreshold = 50; Sensitivity = 4    #  SYNC: zgodne z ENGINE
-        CheckInterval = 1200; TurboThreshold = 150                   #  SYNC: 150 jak w ENGINE (bylo 50)
-        OverrideForceMode = $false; ExtremeGraceSeconds = 8
+        ReadThreshold = 30; WriteThreshold = 20; Sensitivity = 10   # AI-first: szybka reakcja I/O
+        CheckInterval = 1200; TurboThreshold = 50
+        OverrideForceMode = $true; ExtremeGraceSeconds = 8
     }
     OptimizationSettings = @{
         PreloadEnabled = $true
@@ -1419,7 +1419,7 @@ function Get-AIEngines {
     }
     # v40: Pełna lista silników zsynchronizowana z ENGINE
     return @{ 
-        QLearning=$true; Ensemble=$false; Prophet=$true; NeuralBrain=$false
+        QLearning=$false; Ensemble=$true; Prophet=$true; NeuralBrain=$false
         AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true
         Bandit=$true; Genetic=$true; Energy=$true
     }
@@ -4631,10 +4631,10 @@ $gbPower.Controls.Add($Script:cmbForceMode)
 
 # Boost Settings
 $gbBoost = New-GroupBox -Parent $tabSettings -Title "Boost Settings" -X 10 -Y 200 -Width 550 -Height 150
-$boostDur = if ($Script:Config.BoostSettings.BoostDuration) { $Script:Config.BoostSettings.BoostDuration } else { 10000 }
+$boostDur = if ($Script:Config.BoostSettings.BoostDuration) { $Script:Config.BoostSettings.BoostDuration } else { 3500 }
 $boostCool = if ($Script:Config.BoostSettings.BoostCooldown) { $Script:Config.BoostSettings.BoostCooldown } else { 20 }
 $null = New-Label -Parent $gbBoost -Text "Duration (ms):" -X 15 -Y 28 -Width 120 -Height 22
-$Script:numBoostDuration = New-NumericUpDown -Parent $gbBoost -X 140 -Y 25 -Min 5000 -Max 30000 -Value $boostDur -Width 100 -Increment 1000
+$Script:numBoostDuration = New-NumericUpDown -Parent $gbBoost -X 140 -Y 25 -Min 1000 -Max 30000 -Value $boostDur -Width 100 -Increment 500
 $null = New-Label -Parent $gbBoost -Text "Cooldown (s):" -X 260 -Y 28 -Width 110 -Height 22
 $Script:numBoostCooldown = New-NumericUpDown -Parent $gbBoost -X 375 -Y 25 -Min 10 -Max 60 -Value $boostCool -Width 80 -Increment 5
 $autoBoost = if ($null -ne $Script:Config.BoostSettings.AutoBoostEnabled) { $Script:Config.BoostSettings.AutoBoostEnabled } else { $true }
@@ -4907,7 +4907,7 @@ $btnRestoreNetworkDefaults = New-Button -Parent $gbNetworkUltra -Text "WIN DEFAU
             Save-Config $currentConfig
         } catch { }
         
-        try { Send-ReloadSignal @{ Type = "NetworkDefaults"; Action = "RestoreAll" } } catch { }
+        try { Send-ReloadSignal @{ File = "NetworkDefaults"; Action = "RestoreAll" } } catch { }
         
         [System.Windows.Forms.MessageBox]::Show(
             "Ustawienia zapisane!`n`nWAZNE: Zrestartuj ENGINE aby zmiany zostaly zastosowane.",
@@ -4979,7 +4979,7 @@ $toolTip.SetToolTip($btnSaveSettings, " Zapisuje wszystkie ustawienia CONFIGURAT
     # 1. POWER MODES + BOOST + I/O
     # #
     $newConfig = @{
-        ForceMode = switch ($Script:cmbForceMode.SelectedIndex) { 1 { "Silent" } 2 { "Silent Lock" } 3 { "Balanced" } 4 { "Turbo" } 5 { "Extreme" } default { "" } }
+        ForceMode = switch ($Script:cmbForceMode.SelectedIndex) { 1 { "Silent" } 2 { "Silent Lock" } 3 { "Balanced Lock" } 4 { "Balanced" } 5 { "Turbo" } 6 { "Extreme" } default { "" } }
         PowerModes = @{}
         BoostSettings = @{
             BoostDuration = [int]$Script:numBoostDuration.Value
