@@ -2054,6 +2054,9 @@ try { Load-TDPConfig -Path $Script:TDPConfigPath | Out-Null } catch {}
 # ═══════════════════════════════════════════════════════════════════════════════
 $Script:AppCategoriesPath = Join-Path $Script:ConfigDir 'AppCategories.json'
 $Script:AppCategoryPreferences = @{}
+# v43.15: Reverse-lookup: raw process name → klucz w AppCategoryPreferences
+# Pozwala na bezpośrednie dopasowanie przez $Script:LastFgRawProcName bez guessowania nazw
+$Script:AppCategoryProcNameIndex = @{}
 function Load-AppCategories {
     <#
     .SYNOPSIS
@@ -2068,6 +2071,7 @@ function Load-AppCategories {
         # Wczytaj UserPreferences
         if ($json.UserPreferences) {
             $Script:AppCategoryPreferences = @{}
+            $Script:AppCategoryProcNameIndex = @{}
             foreach ($prop in $json.UserPreferences.PSObject.Properties) {
                 $appName = $prop.Name
                 $pref = $prop.Value
@@ -2078,6 +2082,17 @@ function Load-AppCategories {
                     Samples = if ($pref.Samples -ne $null) { [int]$pref.Samples } else { 1 }
                     LastUsed = if ($pref.LastUsed) { $pref.LastUsed } else { "" }
                     HardLock = if ($pref.HardLock -ne $null) { [bool]$pref.HardLock } else { $false }
+                    ProcessName = if ($pref.ProcessName) { $pref.ProcessName } else { $appName -replace '\.exe$', '' }
+                }
+                # v43.15: Buduj reverse-lookup po raw process name (lowercase, bez .exe)
+                $rawKey = ($Script:AppCategoryPreferences[$appName].ProcessName).ToLower() -replace '\.exe$', ''
+                if ($rawKey -and -not $Script:AppCategoryProcNameIndex.ContainsKey($rawKey)) {
+                    $Script:AppCategoryProcNameIndex[$rawKey] = $appName
+                }
+                # Też indeksuj sam klucz (na wypadek gdyby klucz był raw name)
+                $keyNorm = $appName.ToLower() -replace '\.exe$', ''
+                if (-not $Script:AppCategoryProcNameIndex.ContainsKey($keyNorm)) {
+                    $Script:AppCategoryProcNameIndex[$keyNorm] = $appName
                 }
             }
             Write-Log "AppCategories loaded: $($Script:AppCategoryPreferences.Count) apps with preferences" "CONFIG"
@@ -2140,11 +2155,17 @@ function Get-AppCategoryBias {
     param([string]$AppName)
     if (-not $AppName) { return 0.5 }
     $appLower = $AppName.ToLower() -replace '\.exe$', ''
+    $appLowerNorm = ($appLower -replace '\s+', '')
     # Sprawdź czy mamy preferencje dla tej aplikacji
     if ($Script:AppCategoryPreferences -and $Script:AppCategoryPreferences.Count -gt 0) {
         foreach ($key in $Script:AppCategoryPreferences.Keys) {
             $keyLower = $key.ToLower() -replace '\.exe$', ''
-            if ($keyLower -eq $appLower -or $appLower -like "*$keyLower*" -or $keyLower -like "*$appLower*") {
+            $keyLowerNorm = ($keyLower -replace '\s+', '')
+            $matched = ($keyLower -eq $appLower) -or
+                       ($appLower -like "*$keyLower*") -or
+                       ($keyLower -like "*$appLower*") -or
+                       ($keyLowerNorm.Length -gt 4 -and $keyLowerNorm -eq $appLowerNorm)
+            if ($matched) {
                 $pref = $Script:AppCategoryPreferences[$key]
                 if ($pref.HardLock) {
                     # HardLock = użytkownik wymusił kategorię - używaj tego!
@@ -22835,20 +22856,49 @@ $Script:PreviousEnsembleEnabled = $false
                 $hardLockBlocked = $false
                 if ($currentForeground -and $currentForeground -notin @("Desktop", "explorer", "Explorer", "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost", "Widgets")) {
                     $appLower = $currentForeground.ToLower() -replace '\.exe$', ''
-                    $rawProcessName = ""
-                    try {
-                        $hwnd = [Win32]::GetForegroundWindow()
-                        if ($hwnd -ne [IntPtr]::Zero) {
-                            $pid2 = 0; [Win32]::GetWindowThreadProcessId($hwnd, [ref]$pid2) | Out-Null
-                            if ($pid2 -gt 0) { $rawProcessName = (Get-Process -Id $pid2 -ErrorAction SilentlyContinue).ProcessName.ToLower() -replace '\.exe$', '' }
+                    # v43.15 FIX: Używaj $Script:LastFgRawProcName zamiast drugiego wywołania GetForegroundWindow()
+                    # Eliminuje race condition (okno mogło się zmienić między wywołaniami) i błędy dostępu do procesu.
+                    # $Script:LastFgRawProcName jest ustawiany atomowo razem z $currentForeground w Get-ForegroundProcessName.
+                    # Jest to dokładnie ta sama nazwa procesu którą Configurator zapisuje jako klucz w AppCategories.json.
+                    $rawProcessName = if ($Script:LastFgRawProcName) { $Script:LastFgRawProcName.ToLower() -replace '\.exe$', '' } else { "" }
+                    $appLowerNorm = ($appLower -replace '\s+', '')
+                    $rawProcessNorm = ($rawProcessName -replace '\s+', '')
+
+                    # v43.15: FAST PATH - szukaj przez ProcNameIndex (O(1)), zbudowany przy Load-AppCategories
+                    # Próbuje dopasować raw process name → klucz w preferencjach bez pętli
+                    $fastKey = $null
+                    if ($rawProcessName -ne "" -and $Script:AppCategoryProcNameIndex -and $Script:AppCategoryProcNameIndex.ContainsKey($rawProcessName)) {
+                        $fastKey = $Script:AppCategoryProcNameIndex[$rawProcessName]
+                    } elseif ($appLowerNorm.Length -gt 4 -and $Script:AppCategoryProcNameIndex -and $Script:AppCategoryProcNameIndex.ContainsKey($appLowerNorm)) {
+                        $fastKey = $Script:AppCategoryProcNameIndex[$appLowerNorm]
+                    }
+                    if ($fastKey -and $Script:AppCategoryPreferences.ContainsKey($fastKey)) {
+                        $pref = $Script:AppCategoryPreferences[$fastKey]
+                        if ($pref.HardLock) {
+                            $hardLockBias = $pref.Bias
+                            $hardLockMode = if ($hardLockBias -le 0.2) { "Silent" } elseif ($hardLockBias -ge 0.8) { "Turbo" } else { "Balanced" }
+                            $newMode = $hardLockMode
+                            $reason = "HARDLOCK: $currentForeground=$hardLockMode key=$fastKey bias=$([Math]::Round($hardLockBias,2))"
+                            $hardLockBlocked = $true
+                            if ($currentMetrics.Temp -gt 95 -and $hardLockMode -ne "Silent") {
+                                $newMode = "Silent"
+                                $reason = "THERMAL-SAFETY: $([int]$currentMetrics.Temp)C overrides HARDLOCK ($hardLockMode)"
+                            }
                         }
-                    } catch {}
+                    }
+
+                    # FALLBACK: pętla z wieloma warunkami matchowania (dla starszych wpisów bez ProcessName)
+                    if (-not $hardLockBlocked) {
                     foreach ($key in $Script:AppCategoryPreferences.Keys) {
                         $keyLower = $key.ToLower() -replace '\.exe$', ''
-                        $matchFound = ($keyLower -eq $rawProcessName) -or
-                                  ($keyLower -eq $appLower) -or
+                        $keyLowerNorm = ($keyLower -replace '\s+', '')
+                        $matchFound = ($rawProcessName -ne "" -and $keyLower -eq $rawProcessName) -or  # raw exe name match
+                                  ($keyLower -eq $appLower) -or                                        # display name exact match
                                   ($appLower -like "*$keyLower*") -or
                                   ($keyLower -like "*$appLower*") -or
+                                  # space-insensitive: "Little Nightmares III" ↔ "LittleNightmaresIII"
+                                  ($keyLowerNorm.Length -gt 4 -and $keyLowerNorm -eq $appLowerNorm) -or
+                                  ($keyLowerNorm.Length -gt 4 -and $rawProcessNorm -ne "" -and $keyLowerNorm -eq $rawProcessNorm) -or
                                   ($keyLower -eq "google chrome" -and $appLower -eq "chrome") -or
                                   ($keyLower -eq "chrome" -and $appLower -eq "chrome")
                         if ($matchFound) {
@@ -22869,6 +22919,7 @@ $Script:PreviousEnsembleEnabled = $false
                             }
                         }
                     }
+                    } # end fallback
                 }
                 
                 # v42.5 FIX: GPU-BOUND detection — wywoływaj ZAWSZE (nie tylko gdy confident!)

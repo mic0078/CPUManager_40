@@ -5762,6 +5762,8 @@ function Set-AppCategory($appName, $category) {
         }
         $timestamp = (Get-Date).ToString("o")
         # Record user preference in ENGINE format
+        # ProcessName = raw exe name (klucz = to samo), ale zapiszemy też jawnie dla silnika
+        $rawProcName = $appName -replace '\.exe$', ''
         if ($Script:AppCategoryData.UserPreferences.ContainsKey($appName)) {
             $existing = $Script:AppCategoryData.UserPreferences[$appName]
             $Script:AppCategoryData.UserPreferences[$appName] = @{
@@ -5770,6 +5772,7 @@ function Set-AppCategory($appName, $category) {
                 Samples = $existing.Samples + 1
                 LastUsed = $timestamp
                 HardLock = $true  # v43.10: AUTO-ENABLE HardLock when user assigns category
+                ProcessName = $rawProcName  # v43.15: jawny klucz dla silnika (raw exe name)
             }
         } else {
             $Script:AppCategoryData.UserPreferences[$appName] = @{
@@ -5778,6 +5781,7 @@ function Set-AppCategory($appName, $category) {
                 Samples = 1
                 LastUsed = $timestamp
                 HardLock = $true  # v43.10: AUTO-ENABLE HardLock when user assigns category
+                ProcessName = $rawProcName  # v43.15: jawny klucz dla silnika (raw exe name)
             }
         }
         # Update session stats
