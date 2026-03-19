@@ -2854,14 +2854,14 @@ function Get-DefaultConfigTemplate {
         ForceMode = ""
         PowerModes = @{
             Silent   = @{ Min = 35;  Max = 75  }
-            Balanced = @{ Min = 55;  Max = 92  }
-            Turbo    = @{ Min = 80;  Max = 100 }
+            Balanced = @{ Min = 75;  Max = 90  }
+            Turbo    = @{ Min = 90;  Max = 100 }
             Extreme  = @{ Min = 95;  Max = 100 }
         }
         PowerModesIntel = @{
             Silent   = @{ Min = 35;  Max = 75  }
-            Balanced = @{ Min = 55;  Max = 92  }
-            Turbo    = @{ Min = 80;  Max = 100 }
+            Balanced = @{ Min = 75;  Max = 90  }
+            Turbo    = @{ Min = 90;  Max = 100 }
             Extreme  = @{ Min = 95;  Max = 100 }
         }
         BoostSettings = @{
