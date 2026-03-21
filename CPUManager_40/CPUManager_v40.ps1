@@ -16358,7 +16358,10 @@ class AppRAMCache {
         
         # Confidence check
         $effectiveConfidence = $confidence * $this.Aggressiveness
-        if ($effectiveConfidence -lt 0.25) { return $false }  # Za niska pewność → skip
+        if ($effectiveConfidence -lt 0.25) {
+            Write-RCLog "PRELOAD SKIP '$appName': effectiveConf=$([Math]::Round($effectiveConfidence,3)) (conf=$([Math]::Round($confidence,2)) aggr=$([Math]::Round($this.Aggressiveness,2)))"
+            return $false
+        }
         
         # Już w cache → odśwież
         if ($this.CachedApps.ContainsKey($appName)) {
@@ -19104,7 +19107,7 @@ class AppRAMCache {
             if ($this.IsNegativePenalty($appName)) { continue }
             # Tylko LEARNED (mają prawdziwy profil DLL)
             $entry = $this.AppPaths[$appName]
-            if (-not $entry.ContainsKey('LearnedFiles') -or -not $entry.LearnedFiles -or $entry.LearnedFiles.Count -lt 3) { 
+            if (-not $entry.ContainsKey('LearnedFiles') -or -not $entry.LearnedFiles -or $entry.LearnedFiles.Count -lt 2) { 
                 # Brak LearnedFiles — spróbuj załadować z DiskCache manifest
                 if ($this.LoadAppFromDiskCache($appName)) {
                     $loaded++
@@ -21758,6 +21761,8 @@ $Script:PreviousEnsembleEnabled = $false
 
                                 if (-not $loadedFromDisk) {
                                     # PRIORYTET 2: PreloadApp z oryginalnych ścieżek (wolniejsze)
+                                    # exePath musi być znany — ProfileAppModules (poniżej) uczy się go przy
+                                    # pierwszym przełączeniu; przy kolejnym AppPaths już ma ścieżkę
                                     $exePath = ""
                                     if ($appRAMCache.AppPaths.ContainsKey($resolved)) {
                                         $exePath = $appRAMCache.AppPaths[$resolved].ExePath
