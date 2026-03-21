@@ -7362,10 +7362,12 @@ class ProcessWatcher {
     [object] $BoostProcess
     [System.Collections.Generic.Dictionary[string, datetime]] $RecentBoosts
     [int] $BoostCooldownSeconds = 15  #  FIXED: Zmniejszony cooldown z 30s do 15s (konfigurowalny)
+    [System.Collections.Generic.Dictionary[int, datetime]] $PendingIds  # Appki bez okna — czekają na retry
     ProcessWatcher([int]$cooldownSeconds = 15) {
         $this.KnownProcessIds = [System.Collections.Generic.HashSet[int]]::new()
         $this.SessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
         $this.RecentBoosts = [System.Collections.Generic.Dictionary[string, datetime]]::new()
+        $this.PendingIds = [System.Collections.Generic.Dictionary[int, datetime]]::new()
         $this.IsBoosting = $false
         $this.BoostEndTime = [datetime]::MinValue
         $this.BoostProcessName = ""
@@ -7400,10 +7402,76 @@ class ProcessWatcher {
     [bool] ScanAndBoost([System.Collections.Generic.HashSet[string]]$blacklist, [ProphetMemory]$prophet, [double]$cpuSpike = 0, [double]$systemCpu = 0) {
         $foundNew = $false
         try {
+            # ─── RETRY: appki które przy starcie nie miały jeszcze okna ───
+            # Zdarza się często: proces pojawia się zanim zdąży stworzyć MainWindow.
+            # Bez tego bloku PID trafiał do KnownProcessIds na pierwszym odczycie i był
+            # na zawsze ignorowany — aplikacja nie dostawała Turbo w ogóle.
+            if ($this.PendingIds.Count -gt 0 -and -not $this.IsBoosting) {
+                $toRemove = [System.Collections.Generic.List[int]]::new()
+                foreach ($kvp in @($this.PendingIds.GetEnumerator())) {
+                    $ppid = $kvp.Key
+                    # Po 10 sekundach rezygnujemy — nie jest to aplikacja użytkownika
+                    if (([datetime]::Now - $kvp.Value).TotalSeconds -gt 10) { $toRemove.Add($ppid); continue }
+                    try {
+                        $pp = [System.Diagnostics.Process]::GetProcessById($ppid)
+                        $pp.Refresh()
+                        $ppName = $pp.ProcessName
+                        $ppIsApp = $false; $ppWinTitle = ""
+                        # Czy Prophet już zna tę appkę?
+                        if ($prophet.IsKnownHeavy($ppName) -or $prophet.Apps.ContainsKey($ppName)) { $ppIsApp = $true }
+                        # Okno pojawiło się?
+                        if (-not $ppIsApp -and $pp.MainWindowHandle -ne [IntPtr]::Zero) {
+                            $ppIsApp = $true; $ppWinTitle = $pp.MainWindowTitle
+                        }
+                        # Ścieżka wskazuje na appkę użytkownika?
+                        if (-not $ppIsApp) {
+                            try {
+                                $ppPath = $pp.MainModule.FileName
+                                if ($ppPath -and ($ppPath -match "Program Files" -or $ppPath -match "Users\\[^\\]+\\AppData" -or
+                                    $ppPath -match "Games" -or $ppPath -match "Steam")) { $ppIsApp = $true }
+                            } catch { }
+                        }
+                        if ($ppIsApp) {
+                            $toRemove.Add($ppid)
+                            [void]$this.KnownProcessIds.Add($ppid)
+                            # Sprawdź HardLock
+                            $ppLower = $ppName.ToLower() -replace '\.exe$', ''
+                            $ppHardLock = $false
+                            if ($Script:AppCategoryPreferences) {
+                                foreach ($ck in $Script:AppCategoryPreferences.Keys) {
+                                    $ckl = $ck.ToLower() -replace '\.exe$', ''
+                                    if ($ckl -eq $ppLower -or $ppLower -like "*$ckl*" -or $ckl -like "*$ppLower*") {
+                                        if ($Script:AppCategoryPreferences[$ck].HardLock) { $ppHardLock = $true; break }
+                                    }
+                                }
+                            }
+                            if (-not $ppHardLock -and -not $this.IsOnCooldown($ppName)) {
+                                $this.IsBoosting = $true
+                                $this.BoostEndTime = (Get-Date).AddMilliseconds($Script:BoostDuration)
+                                $this.BoostProcessName = $ppName
+                                $this.BoostProcess = $pp
+                                $this.PeakCPU = 0.0; $this.PeakIO = 0.0
+                                $this.RecentBoosts[$ppName] = Get-Date
+                                $this.BoostDisplayName = Get-ProcessDisplayName -ProcessName $ppName -Process $pp
+                                try { $pp.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal } catch { }
+                                $foundNew = $true
+                                if ($Global:DebugMode) { Add-Log "PENDING BOOST: $ppName (okno gotowe)" -Debug }
+                            }
+                        }
+                    } catch { $toRemove.Add($ppid) }  # Proces już nie istnieje
+                }
+                foreach ($ppid in $toRemove) {
+                    [void]$this.PendingIds.Remove($ppid)
+                    [void]$this.KnownProcessIds.Add($ppid)
+                }
+                if ($foundNew) { return [bool]$foundNew }
+            }
+            # ─── GŁÓWNE SKANOWANIE nowych procesów ───
             $processes = [System.Diagnostics.Process]::GetProcesses()
             foreach ($process in $processes) {
                 try {
                     if ($this.KnownProcessIds.Contains($process.Id)) { continue }
+                    if ($this.PendingIds.ContainsKey($process.Id)) { continue }  # Już w kolejce retry
                     $processName = $process.ProcessName
                     # Dodaj do known NATYCHMIAST - zapobiega wielokrotnemu przetwarzaniu
                     [void]$this.KnownProcessIds.Add($process.Id)
@@ -7478,6 +7546,10 @@ class ProcessWatcher {
                     if ($prophet.IsKnownHeavy($processName)) { 
                         $isLikelyApp = $true 
                     }
+                    # 1b. Znana w Prophet w ogóle (niekoniecznie heavy) — na pewno appka użytkownika
+                    if (-not $isLikelyApp -and $prophet.Apps.ContainsKey($processName)) {
+                        $isLikelyApp = $true
+                    }
                     # 2. Ma okno
                     if (-not $isLikelyApp) {
                         try {
@@ -7498,9 +7570,18 @@ class ProcessWatcher {
                             }
                         } catch { }
                     }
-                    if (-not $isLikelyApp) { continue }
-                    # Jesli juz boostujemy inny proces - nie startuj nowego
-                    if ($this.IsBoosting) { continue }
+                    if (-not $isLikelyApp) {
+                        # Okno jeszcze nie gotowe — poczekaj (max 10s) zamiast ignorować na zawsze
+                        [void]$this.KnownProcessIds.Remove($process.Id)
+                        $this.PendingIds[$process.Id] = Get-Date
+                        continue
+                    }
+                    # Jesli juz boostujemy inny proces - odloz na pozniej zamiast ignorowac
+                    if ($this.IsBoosting) {
+                        [void]$this.KnownProcessIds.Remove($process.Id)
+                        $this.PendingIds[$process.Id] = Get-Date
+                        continue
+                    }
                     
                     # v43.10 FIX: Sprawdź HardLock PRZED włączeniem BOOST
                     # Jeśli aplikacja ma HardLock w AppCategories.json, NIE BOOSTUJ - użytkownik wymusza tryb
@@ -7640,6 +7721,7 @@ class ProcessWatcher {
     [void] Cleanup() {
         $this.KnownProcessIds.Clear()
         $this.RecentBoosts.Clear()
+        $this.PendingIds.Clear()
         if ($this.BoostProcess) {
             try { $this.BoostProcess.Dispose() } catch { }
             $this.BoostProcess = $null
