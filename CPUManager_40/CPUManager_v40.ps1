@@ -21329,6 +21329,7 @@ $Script:PreviousEnsembleEnabled = $false
     # ═══ APP RAM CACHE — prawdziwy preload aplikacji do RAM ═══
     $appRAMCache = [AppRAMCache]::new()
     $Script:AppRAMCache = $appRAMCache
+    $Script:RAMCacheLastForcedSave = [datetime]::Now
     
     # Ustaw DiskCacheDir
     if ($Script:CacheDir) { $appRAMCache.DiskCacheDir = $Script:CacheDir }
@@ -23367,9 +23368,21 @@ $Script:PreviousEnsembleEnabled = $false
                         if ($appRAMCache.IsDirty) {
                             $appRAMCache.SaveState($Script:ConfigDir)
                             $appRAMCache.IsDirty = $false
+                            $Script:RAMCacheLastForcedSave = [datetime]::Now
                             if ($Global:DebugMode) {
                                 Add-Log "- RAMCache SAVED: Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count) → C:\CPUManager\RAMCache.json"
                             }
+                        }
+                    }
+                    # Forced save co 5 minut niezależnie od IsDirty — gwarantuje zapis podczas długich sesji gaming/rendering
+                    if (([datetime]::Now - $Script:RAMCacheLastForcedSave).TotalMinutes -ge 5) {
+                        $appRAMCache.SaveState($Script:ConfigDir)
+                        $appRAMCache.IsDirty = $false
+                        $Script:RAMCacheLastForcedSave = [datetime]::Now
+                        Write-RCLog "PERIODIC SAVE (5min forced): Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count)"
+                        # Odśwież manifesty wszystkich znanych apek (Cache\*.json) — gaming/rendering nie triggeruje ich zapisu
+                        foreach ($cachedApp in @($appRAMCache.AppPaths.Keys)) {
+                            $appRAMCache.SaveAppToDiskCache($cachedApp)
                         }
                     }
                     
