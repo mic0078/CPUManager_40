@@ -11291,10 +11291,10 @@ class EnsembleVoter {
     EnsembleVoter() {
         #  WSZYSTKIE modeli z podobnymi wagami - DEMOKRATYCZNE glosowanie
         $this.Weights = @{ 
+            # G-1 FIX: Removed dead Bandit=0.05, Genetic=0.06, Tuner=0.06 (not in $modelScores/$ensembleDecisions)
+            # H-2 FIX: Added AppIntel=0.20 — aggregates all engine knowledge per-app (matches high DecideMode weight=2.5)
             "Brain" = 0.08
             "QLearning" = 0.08
-            "Bandit" = 0.05
-            "Genetic" = 0.06
             "Context" = 0.07
             "Thermal" = 0.06
             "Pattern" = 0.07
@@ -11302,21 +11302,21 @@ class EnsembleVoter {
             "Predictor" = 0.06
             "Chain" = 0.05
             "Trend" = 0.06
-            "Tuner" = 0.06
             "Energy" = 0.06
             "Prophet" = 0.06
             "Anomaly" = 0.06
             "Activity" = 0.06
             "IOMonitor" = 0.08
-            "RAMMonitor" = 0.08   # V35 NEW: RAM Monitor jako glos
+            "AppIntel" = 0.20     # Agreguje wiedzę wszystkich silników per-app (najwyższa waga)
+            "RAMMonitor" = 0.08   # V35 NEW: RAM Monitor jako glos (injektowany przez Vote())
             "NetworkAI" = 0.08    # NetworkAI learned network patterns
             "PowerBoost" = 0.05   # PowerBoost signal
         }
         $this.Accuracy = @{ 
+            # G-1 FIX: Removed dead Bandit=0.4, Genetic=0.5, Tuner=0.5 (not in $modelScores/$ensembleDecisions)
+            # H-2 FIX: Added AppIntel=0.7 — high initial accuracy (aggregates all engines)
             "Brain" = 0.6
             "QLearning" = 0.5
-            "Bandit" = 0.4
-            "Genetic" = 0.5
             "Context" = 0.6
             "Thermal" = 0.5
             "Pattern" = 0.6
@@ -11324,12 +11324,12 @@ class EnsembleVoter {
             "Predictor" = 0.5
             "Chain" = 0.4
             "Trend" = 0.5
-            "Tuner" = 0.5
             "Energy" = 0.5
             "Prophet" = 0.5
             "Anomaly" = 0.7
             "Activity" = 0.6
             "IOMonitor" = 0.6
+            "AppIntel" = 0.7     # Wysoka accuracy — agreguje wiedzę wszystkich silników per-app
             "RAMMonitor" = 0.7   # V35 NEW: RAM Monitor accuracy (wysoka - spikes sa wiarygodne)
             "NetworkAI" = 0.5    # NetworkAI accuracy (learns over time)
             "PowerBoost" = 0.5   # PowerBoost accuracy
@@ -12831,7 +12831,7 @@ class AICoordinator {
             "IOMonitor" = 1.0; "NetworkAI" = 0.8; "Pattern" = 1.0; "Brain" = 1.0
             "Chain" = 0.8; "Predictor" = 0.7
             "Anomaly" = 0.8; "Activity" = 0.6; "PowerBoost" = 0.5
-            "AppIntel" = 2.5; "Ensemble" = 1.4; "RAMMonitor" = 1.0
+            "AppIntel" = 2.5; "Ensemble" = 1.4  # H-1 FIX: RAMMonitor removed — RAM reaches DecideMode via EnsembleVoter.Vote() injection, not $modelScores
         }
         
         # v43.14: Adaptive weights - silniki które trafnie głosują dostają wyższą wagę
@@ -22854,6 +22854,7 @@ $Script:PreviousEnsembleEnabled = $false
                 $prevMode = $Script:V42_PrevMode
                 $newMode = $prevMode  # Domyślnie: trzymaj obecny tryb
                 $reason = ""
+                $hardLockBlocked = $false  # P-1 FIX: init BEFORE ForceMode/IOOverride paths (was inside else{} only)
                 # Sprawdz czy I/O moze nadpisac ForceMode
                 $currentIOTotal = $diskReadMB + $diskWriteMB
                 $ioCanOverride = $Script:IOOverrideForceMode -and $currentIOTotal -gt $Script:IOTurboThreshold
@@ -23937,6 +23938,9 @@ $Script:PreviousEnsembleEnabled = $false
             if ($iteration - $lastSelfTuneEval -ge 15 -and (Is-SelfTunerEnabled)) {
                 $lastSelfTuneEval = $iteration
                 $selfTuner.EvaluateDecisions($currentMetrics.CPU, $currentMetrics.Temp)
+                # K-1 FIX: SelfTuner adaptive thresholds → $Script scope (used in AI decision logic every iteration)
+                $Script:TurboThreshold = [int]$selfTuner.GetTurboThreshold()
+                $Script:BalancedThreshold = [int]$selfTuner.GetBalancedThreshold()
                 #  Szybkie zapisywanie decyzji SelfTunera (co 45 iteracji = ~90 sekund)
                 # Zapobiega utracie nauczonego stanu przy naglym wylaczeniu
                 if ($iteration % 45 -eq 0) {
@@ -24029,13 +24033,13 @@ $Script:PreviousEnsembleEnabled = $false
                     # Core AI
                     & $cacheWrite "AnomalyProfiles.json" @{ Profiles = $anomalyDetector.Profiles } 4
                     & $cacheWrite "LoadPatterns.json" @{ Patterns = $loadPredictor.HourlyPatterns; DayPatterns = $loadPredictor.DayOfWeekPatterns } 4
-                    & $cacheWrite "SelfTuner.json" @{ History = $selfTuner.TuningHistory; CurrentParams = $selfTuner.CurrentParams }
+                    try { $selfTuner.SaveState($Script:ConfigDir) } catch {}  # J-1 FIX: delegate to SaveState() — wrong TuningHistory/CurrentParams fields removed
                     & $cacheWrite "ChainPredictor.json" @{ TransitionMatrix = $chainPredictor.TransitionMatrix }
                     & $cacheWrite "UserPatterns.json" @{ HourlyPatterns = $userPatterns.HourlyPatterns; DayOfWeekPatterns = $userPatterns.DayOfWeekPatterns; AppUsagePatterns = $userPatterns.AppUsagePatterns }
                     # Mega AI
                     & $cacheWrite "QLearning.json" @{ QTable = $qLearning.QTable; ExplorationRate = $qLearning.ExplorationRate; TotalUpdates = $qLearning.TotalUpdates }
                     & $cacheWrite "EnsembleWeights.json" @{ Weights = $ensemble.Weights; Accuracy = $ensemble.Accuracy }
-                    & $cacheWrite "EnergyStats.json" @{ ModeStats = $energyTracker.ModeStats; HourlyStats = $energyTracker.HourlyStats }
+                    & $cacheWrite "EnergyStats.json" @{ TotalScore = $energyTracker.TotalScore; Samples = $energyTracker.Samples; ModeStats = $energyTracker.ModeStats } 3  # J-2 FIX: HourlyStats→TotalScore+Samples
                     # Ultra AI
                     & $cacheWrite "Bandit.json" @{ Successes = $bandit.Successes; Failures = $bandit.Failures; TotalPulls = $bandit.TotalPulls }
                     & $cacheWrite "Genetic.json" @{ Population = $genetic.Population; Generation = $genetic.Generation }
