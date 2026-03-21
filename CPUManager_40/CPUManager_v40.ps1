@@ -17571,9 +17571,14 @@ class AppRAMCache {
                     if ($f.ContainsKey('Accessor') -and $f.Accessor -and $f.ContainsKey('SizeBytes')) {
                         $size = $f.SizeBytes
                         $dummyByte = [byte]0
-                        # Dynamiczny stride: małe pliki (<200MB) co 64KB, duże co 512KB.
-                        # Zapobiega blokującym spiком CPU przy wielogigabajtowym cache.
-                        $retouchStride = if ($size -gt 200MB) { 524288 } else { 65536 }
+                        # Tiered stride: im mniejszy plik, tym gęściej dotykamy stron.
+                        # Cel: Windows uznaje stronę za "hot" gdy dostęp w ostatnich ~60s.
+                        # Brak retouch strony → strona staje się "cold standby" → pierwsza do wyrzucenia.
+                        # <5MB:    4KB stride  → każda strona (100% coverage — DLL systemowe, exe)
+                        # 5-100MB: 16KB stride → co 4. strona (25% — główne runtime DLL)
+                        # 100MB-1GB: 64KB stride → co 16. strony (6% — shadery, paki gier)
+                        # >1GB:   256KB stride → co 64. strony (1.5% — ogromne pak files)
+                        $retouchStride = if ($size -ge 1GB) { 262144 } elseif ($size -ge 100MB) { 65536 } elseif ($size -ge 5MB) { 16384 } else { 4096 }
                         for ($offset = 0; $offset -lt $size; $offset += $retouchStride) {
                             $dummyByte = $f.Accessor.ReadByte($offset)
                         }
@@ -18812,7 +18817,10 @@ class AppRAMCache {
             foreach ($app in @($this.AppPaths.Keys)) {
                 try {
                     $entry = $this.AppPaths[$app]
-                    if (-not $entry -or -not $entry.ExePath) { continue }
+                    # Zachowaj wpisy z pustym ExePath jeśli mają LearnedFiles
+                    # (ExePath czyszczone gdy exe przeniesiony/zaktualizowany, ale LearnedFiles wciąż ważne)
+                    $hasLF = $entry.ContainsKey('LearnedFiles') -and $entry.LearnedFiles -and $entry.LearnedFiles.Count -gt 0
+                    if (-not $entry -or (-not $entry.ExePath -and -not $hasLF)) { continue }
                     $pathEntry = @{ 
                         ExePath = [string]$entry.ExePath
                         Dir = [string]$entry.Dir 
@@ -21524,10 +21532,18 @@ $Script:PreviousEnsembleEnabled = $false
                 } catch {}
 
                 # ── LAUNCH RACE TICK: Agresywny preload podczas startu app ──
+                # (wewnątrz % 2 bo detekcja nowych PID-ów jest tutaj)
                 if ($appRAMCache.IsInLaunchRace) {
                     $prophetAppsRef2 = if ($prophet) { $prophet.Apps } else { $null }
                     $appRAMCache.LaunchRaceTick($prophetAppsRef2) | Out-Null
                 }
+            }
+
+            # ── LAUNCH RACE TICK EXTRA: wywołaj RÓWNIEŻ co iterację (nie tylko co % 2)
+            # ForceBatchTick pomija 200ms timer → pliki ładowane max. szybko podczas startu app.
+            # Bez tego: LaunchRace wolny o ~2× (wywołanie co ~1.6s zamiast co ~0.8s).
+            if ($appRAMCache -and $appRAMCache.Enabled -and $appRAMCache.IsInLaunchRace -and ($iteration % 2 -ne 0)) {
+                $appRAMCache.ForceBatchTick() | Out-Null
             }
 
             # Aktualizuj statystyki sieci co 10 iteracji (~10s) - totale sesji nie musza byc co sekunde
