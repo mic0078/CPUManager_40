@@ -2632,7 +2632,7 @@ $trayEngines.Text = "Silniki AI"
 $trayEnableAll = New-Object System.Windows.Forms.ToolStripMenuItem
 $trayEnableAll.Text = "Wlacz CORE"
 $trayEnableAll.Add_Click({
-    $all = @{ QLearning=$false; Ensemble=$true; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true }
+    $all = @{ QLearning=$false; Ensemble=$true; Prophet=$true; NeuralBrain=$false; AnomalyDetector=$true; SelfTuner=$true; ChainPredictor=$true; LoadPredictor=$true; Bandit=$true; Genetic=$true; Energy=$true }
     Save-TrayAIEngines $all | Out-Null
     $Script:TrayEngineItems['QLearning'].Checked = $false
     $Script:TrayEngineItems['Ensemble'].Checked = $true
@@ -6690,6 +6690,33 @@ class GPUBoundDetector {
         return $result
     }
     
+    # Persystencja — zapisuje stan GPU-Bound między restartami
+    [void] SaveState([string]$configDir) {
+        try {
+            $data = @{
+                DetectionCount      = $this.DetectionCount
+                IsConfident         = $this.IsConfident
+                LastExitTime        = if ($this.LastExitTime -ne [datetime]::MinValue) { $this.LastExitTime.ToString('o') } else { "" }
+                LastSuggestedMode   = $this.LastSuggestedMode
+            }
+            $json = $data | ConvertTo-Json -Depth 2 -Compress
+            [System.IO.File]::WriteAllText("$configDir\GPUBound.json", $json, [System.Text.Encoding]::UTF8)
+        } catch { }
+    }
+    [void] LoadState([string]$configDir) {
+        $path = "$configDir\GPUBound.json"
+        if (-not (Test-Path $path)) { return }
+        try {
+            $json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            $data = $json | ConvertFrom-Json
+            if ($null -ne $data.DetectionCount)    { $this.DetectionCount    = [int]$data.DetectionCount }
+            if ($null -ne $data.IsConfident)       { $this.IsConfident       = [bool]$data.IsConfident }
+            if ($data.LastExitTime -and $data.LastExitTime -ne "") {
+                $this.LastExitTime = [datetime]::Parse($data.LastExitTime)
+            }
+            if ($data.LastSuggestedMode)           { $this.LastSuggestedMode = [string]$data.LastSuggestedMode }
+        } catch { }
+    }
     # Reset detektora
     [void] Reset() {
         $this.DetectionCount = 0
@@ -11282,6 +11309,8 @@ class EnsembleVoter {
             "Activity" = 0.06
             "IOMonitor" = 0.08
             "RAMMonitor" = 0.08   # V35 NEW: RAM Monitor jako glos
+            "NetworkAI" = 0.08    # NetworkAI learned network patterns
+            "PowerBoost" = 0.05   # PowerBoost signal
         }
         $this.Accuracy = @{ 
             "Brain" = 0.6
@@ -11302,6 +11331,8 @@ class EnsembleVoter {
             "Activity" = 0.6
             "IOMonitor" = 0.6
             "RAMMonitor" = 0.7   # V35 NEW: RAM Monitor accuracy (wysoka - spikes sa wiarygodne)
+            "NetworkAI" = 0.5    # NetworkAI accuracy (learns over time)
+            "PowerBoost" = 0.5   # PowerBoost accuracy
         }
         $this.TotalVotes = 0
         $this.LastRAM = 0
@@ -12800,7 +12831,7 @@ class AICoordinator {
             "IOMonitor" = 1.0; "NetworkAI" = 0.8; "Pattern" = 1.0; "Brain" = 1.0
             "Chain" = 0.8; "Predictor" = 0.7
             "Anomaly" = 0.8; "Activity" = 0.6; "PowerBoost" = 0.5
-            "AppIntel" = 2.5
+            "AppIntel" = 2.5; "Ensemble" = 1.4; "RAMMonitor" = 1.0
         }
         
         # v43.14: Adaptive weights - silniki które trafnie głosują dostają wyższą wagę
@@ -12811,6 +12842,19 @@ class AICoordinator {
             $adaptive = if ($this.AdaptiveWeights.ContainsKey($engine)) { $this.AdaptiveWeights[$engine] } else { 1.0 }
             # Adaptive range: 0.5x to 1.5x base weight (nie za ekstremalny)
             $weights[$engine] = $base * [Math]::Min(1.5, [Math]::Max(0.5, $adaptive))
+        }
+        
+        # BUG#7 FIX: ActiveEngine throttling — DecideActiveEngine wybiera silnik pod obciążeniem,
+        # ale DecideMode musi to respektować obniżając wagi wyłączonych silników.
+        if ($this.ActiveEngine -eq "QLearning") {
+            # Krytyczne obciążenie (CPU>85%) — tylko QLearning, reszta do 5% wagi
+            $primarySet = @("QLearning", "AppIntel", "Thermal", "Context", "Phase", "GPU")
+            foreach ($key in @($weights.Keys)) {
+                if ($key -notin $primarySet) { $weights[$key] = $weights[$key] * 0.05 }
+            }
+        } elseif ($this.ActiveEngine -eq "Hybrid") {
+            # Wysokie obciążenie (CPU>70%) — Ensemble schodzi na dalszy plan
+            if ($weights.ContainsKey("Ensemble")) { $weights["Ensemble"] = $weights["Ensemble"] * 0.2 }
         }
         
         # Dodaj Phase score do modelScores
@@ -20205,6 +20249,11 @@ function Save-State {
                 HourHits = $app.HourHits
                 PrevApps = $app.PrevApps
                 IsHeavy = $app.IsHeavy
+                IsGPUBound = if ($app.ContainsKey('IsGPUBound')) { $app.IsGPUBound } else { $false }
+                ModeHistory = if ($app.ContainsKey('ModeHistory')) { $app.ModeHistory } else { @{ Silent=0; Balanced=0; Turbo=0 } }
+                ModeRewards = if ($app.ContainsKey('ModeRewards')) { $app.ModeRewards } else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
+                PreferredMode = if ($app.ContainsKey('PreferredMode')) { $app.PreferredMode } else { "" }
+                PhasePreferred = if ($app.ContainsKey('PhasePreferred')) { $app.PhasePreferred } else { @{} }
                 Samples = if ($app.ContainsKey('Samples')) { $app.Samples } else { 0 }
                 SessionRuntime = if ($app.ContainsKey('SessionRuntime')) { $app.SessionRuntime } else { 0.0 }
             }
@@ -20218,6 +20267,7 @@ function Load-State {
     $brain = [NeuralBrain]::new()
     $prophet = [ProphetMemory]::new()
     $gpuBound = [GPUBoundDetector]::new()  # v42.1: GPU-Bound Detector
+    if (Test-Path "$Script:ConfigDir\GPUBound.json") { try { $gpuBound.LoadState($Script:ConfigDir) } catch {} }
     # Powod: Dane Brain moga istniec z poprzedniej sesji - zachowujemy je
     if (Test-Path $Script:BrainPath) {
         try {
@@ -20258,6 +20308,12 @@ function Load-State {
                         HourHits = if ($appData.HourHits) { [int[]]$appData.HourHits } else { [int[]]::new(24) }
                         PrevApps = @{}
                         IsHeavy = [bool]$appData.IsHeavy
+                        IsGPUBound = if ($null -ne $appData.IsGPUBound) { [bool]$appData.IsGPUBound } else { $false }
+                        ModeHistory = if ($appData.ModeHistory) { @{ Silent=[int]$appData.ModeHistory.Silent; Balanced=[int]$appData.ModeHistory.Balanced; Turbo=[int]$appData.ModeHistory.Turbo } } else { @{ Silent=0; Balanced=0; Turbo=0 } }
+                        ModeRewards = if ($appData.ModeRewards) { @{ Silent=[double]$appData.ModeRewards.Silent; Balanced=[double]$appData.ModeRewards.Balanced; Turbo=[double]$appData.ModeRewards.Turbo } } else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
+                        PreferredMode = if ($appData.PreferredMode) { [string]$appData.PreferredMode } else { "" }
+                        PhasePreferred = @{}
+                        AvgGPU = if ($null -ne $appData.AvgGPU) { [double]$appData.AvgGPU } else { 0.0 }
                         Samples = if ($appData.Samples) { [int]$appData.Samples } else { 0 }
                         SessionRuntime = if ($appData.SessionRuntime) { [double]$appData.SessionRuntime } else { 0.0 }
                     }
@@ -20265,6 +20321,19 @@ function Load-State {
                         $appData.PrevApps.PSObject.Properties | ForEach-Object {
                             $prevName = $_.Name  # v39 FIX: Osobna zmienna dla wewnetrznej petli
                             $app.PrevApps[$prevName] = [int]$_.Value
+                        }
+                    }
+                    if ($appData.PhasePreferred) {
+                        $appData.PhasePreferred.PSObject.Properties | ForEach-Object {
+                            $phaseName = $_.Name
+                            $phaseVal = $_.Value
+                            if ($phaseVal -and $phaseVal.BestMode) {
+                                $app.PhasePreferred[$phaseName] = @{
+                                    BestMode = [string]$phaseVal.BestMode
+                                    TotalCount = if ($null -ne $phaseVal.TotalCount) { [int]$phaseVal.TotalCount } else { 0 }
+                                    Modes = if ($phaseVal.Modes) { @{ Silent=[int]$phaseVal.Modes.Silent; Balanced=[int]$phaseVal.Modes.Balanced; Turbo=[int]$phaseVal.Modes.Turbo } } else { @{ Silent=0; Balanced=0; Turbo=0 } }
+                                }
+                            }
                         }
                     }
                     $prophet.Apps[$appName] = $app  # v39 FIX: Uzywaj zachowanej nazwy
@@ -21851,9 +21920,16 @@ $Script:PreviousEnsembleEnabled = $false
                         $aiCoordinator.IntegrateGPUBoundData($gpuBound, $transferData)
                         $aiCoordinator.IntegrateBanditData($bandit, $transferData)
                         $aiCoordinator.IntegrateGeneticData($genetic, $transferData)
+                        # Apply enriched knowledge to live in-memory engines
+                        if (Is-EnsembleEnabled) {
+                            $aiCoordinator.ApplyEnrichedToEnsemble($ensemble, $transferData)
+                        }
+                        if (Is-NeuralBrainEnabled) {
+                            $aiCoordinator.ApplyToNeuralBrain($brain, $transferData)
+                        }
                         # Save TransferCache
                         $transferData | ConvertTo-Json -Depth 5 | Set-Content "$($Script:ConfigDir)\TransferCache.json" -Encoding UTF8 -Force
-                        Add-Log "  PERIODIC Knowledge Transfer #$($aiCoordinator.TransferCount): Q→Prophet→SK"
+                        Add-Log "  PERIODIC Knowledge Transfer #$($aiCoordinator.TransferCount): Q→Prophet→Ensemble→Brain"
                     }
                 } catch {}
             }
@@ -23980,6 +24056,7 @@ $Script:PreviousEnsembleEnabled = $false
                     try { $processAI.SaveState($Script:ConfigDir) } catch {}
                     try { $gpuAI.SaveState($Script:ConfigDir) } catch {}
                     try { $systemGovernor.SaveState($Script:ConfigDir) } catch {}
+                    try { $gpuBound.SaveState($Script:ConfigDir) } catch {}
                 } catch { }
                 if ($systemGovernor -and $systemGovernor.LearnedGPUPrefs.Count -gt 0) {
                     try {
