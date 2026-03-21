@@ -131,8 +131,7 @@ echo echo Usuwanie zadania harmonogramu...
 echo schtasks /delete /tn "CPU Manager v40 Autostart" /f ^>nul 2^>nul
 echo schtasks /delete /tn "CPU Manager Widget v40 Autostart" /f ^>nul 2^>nul
 echo schtasks /delete /tn "CPU Manager CompactMonitor v40 Autostart" /f ^>nul 2^>nul
-echo schtasks /delete /tn "CPU Manager Configurator v40 Autostart" /f ^>nul 2^>nul
-echo echo.
+echo schtasks /delete /tn "CPU Manager Configurator v40 Autostart" /f ^>nul 2^>nulecho echo.
 echo Odinstalowano pomyslnie.
 echo pause
 ) > "%INSTALL_DIR%\Uninstall_v40.bat"

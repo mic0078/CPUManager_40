@@ -2222,8 +2222,6 @@ $signalFiles = @(
     "$signalDir\Widget.pid"
 )
 Remove-FilesIfExist $signalFiles
-# Odbuduj cache ikon Windows na starcie
-Rebuild-IconCache
 # Reset WidgetData.json to default values on startup
 # NOTE: Avoid unconditional overwrite -- only create defaults when file is missing or empty.
 $widgetDataPath = Join-Path $signalDir 'WidgetData.json'
