@@ -7062,17 +7062,31 @@ class ProphetMemory {
         if ([string]::IsNullOrWhiteSpace($name) -or -not $this.Apps.ContainsKey($name)) { return "" }
         $app = $this.Apps[$name]
         if (-not $app.ContainsKey('PhasePreferred')) { return "" }
-        if (-not $app.ContainsKey('PreferredMode')) { return "" }
-        # Najpierw per-phase (bardziej specyficzne)
+        if (-not $app.ContainsKey('PreferredMode'))  { return "" }
+        # Per-phase (bardziej specyficzne) — wymaga TotalCount >= 15
         if ($phase -and $app.PhasePreferred.ContainsKey($phase)) {
             $pp = $app.PhasePreferred[$phase]
-            # Nowa struktura z BestMode
             if ($pp.ContainsKey('BestMode') -and $pp.ContainsKey('TotalCount') -and $pp.TotalCount -ge 15) {
                 return $pp.BestMode
             }
         }
-        # Fallback: ogólny PreferredMode (z ModeRewards)
+        # Fallback ogólny: PreferredMode ustawiony przez LearnMode (wymaga >= 30 próbek)
         if ($app.PreferredMode) { return $app.PreferredMode }
+        # FIX: Wczesne uczenie — gdy PreferredMode jeszcze nie ustawiony ale jest już dominujący tryb w ModeHistory
+        # Zapobiega sytuacji gdzie Prophet milczy mimo 100+ obserwacji jednego trybu
+        if ($app.ContainsKey('ModeHistory')) {
+            $mh = $app.ModeHistory
+            $total = $mh["Silent"] + $mh["Balanced"] + $mh["Turbo"]
+            if ($total -ge 10) {
+                $dominant = "Balanced"
+                $domCount = 0
+                foreach ($m in @("Silent", "Balanced", "Turbo")) {
+                    if ($mh[$m] -gt $domCount) { $domCount = $mh[$m]; $dominant = $m }
+                }
+                # Sugeruj tylko gdy dominacja jest wyraźna (>70% użyć)
+                if ($domCount -ge ($total * 0.70)) { return $dominant }
+            }
+        }
         return ""
     }
     [void] RecordLaunch([string]$name, [double]$peakCPU, [double]$peakIO, [string]$displayName) {
@@ -22994,8 +23008,27 @@ $Script:PreviousEnsembleEnabled = $false
                 # v43.14: Prophet LearnMode - CO ITERACJĘ uczy się jaki tryb działa per-app per-phase
                 if ($currentForeground -and $currentForeground -ne "Desktop" -and (Is-ProphetEnabled)) {
                     try {
-                        # Reward: używamy tego samego co Q-Learning (spójność)
-                        $prophetReward = if ($qLearning.LastReward) { $qLearning.LastReward } else { 0.0 }
+                        # FIX PROPHET-REWARD: Poprzednio: if ($qLearning.LastReward) — falsy dla 0.0!
+                        # Prophet dostawał reward=0.0 przez 95% ticków (Q-Learning ewaluuje co 10-60s,
+                        # między ewaluacjami LastReward=0.0 i warunek był $false).
+                        # Rozwiązanie: oblicz własną nagrodę z bieżących metryk (natychmiastową),
+                        # uzupełnioną przez LastReward Q-Learning gdy jest dostępna (niezerowa).
+                        $prophetReward = if ($null -ne $qLearning.LastReward -and $qLearning.LastReward -ne 0.0) {
+                            $qLearning.LastReward   # Q-Learning właśnie ocenił decyzję — użyj jego oceny
+                        } else {
+                            # Własna ocena Prophet: nagroda na podstawie temp+CPU w bieżącej chwili
+                            # Balanced przy niskiej temp i CPU = dobra decyzja (0.6-0.7)
+                            # Turbo przy wysokiej temp = zła decyzja (0.3)
+                            $pTemp  = $currentMetrics.Temp
+                            $pCPU   = $currentMetrics.CPU
+                            $pScore = 0.5
+                            switch ($currentState) {
+                                "Balanced" { $pScore = 0.6; if ($pTemp -lt 75) { $pScore += 0.1 } }
+                                "Turbo"    { $pScore = if ($pCPU -gt 65) { 0.65 } else { 0.35 }; if ($pTemp -gt 88) { $pScore -= 0.2 } }
+                                "Silent"   { $pScore = if ($pCPU -lt 25) { 0.65 } else { 0.35 } }
+                            }
+                            [Math]::Max(0.1, [Math]::Min(0.9, $pScore))
+                        }
                         $prophet.LearnMode($currentForeground, $currentState, $prophetReward, $phaseDetector.CurrentPhase, $gpuLoad)
                     } catch {}
                 }
