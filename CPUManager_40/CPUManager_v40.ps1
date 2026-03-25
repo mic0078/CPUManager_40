@@ -1130,6 +1130,69 @@ if (-not (Get-Command -Name Write-Log -ErrorAction SilentlyContinue)) {
 }
 $ErrorLogPath = "C:\CPUManager\ErrorLog.txt"
 Ensure-FileExists $ErrorLogPath
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REFACTOR 1: POMOCNICZE FUNKCJE I/O — eliminacja 29×ReadAllText + 41×WriteAllText
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Odczyt JSON z pliku — Test-Path + ReadAllText + ConvertFrom-Json w jednym
+# Zwraca $null gdy plik nie istnieje lub jest uszkodzony (bez rzucania wyjątku)
+function Read-JsonFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    try {
+        return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    } catch {
+        try { Add-Content -Path $ErrorLogPath -Value "$(Get-Date -f 'HH:mm:ss') Read-JsonFile ERROR [$Path]: $_" -Encoding UTF8 } catch {}
+        return $null
+    }
+}
+
+# Zapis JSON do pliku — atomowy przez tmp → rename, z opcjonalnym Depth
+# Zwraca $true przy sukcesie, $false przy błędzie
+function Write-JsonFile {
+    param(
+        [string]$Path,
+        [object]$Data,
+        [int]$Depth = 5
+    )
+    if (-not $Path) { return $false }
+    try {
+        $json = $Data | ConvertTo-Json -Depth $Depth -Compress
+        $tmp = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Encoding]::UTF8)
+        try {
+            Move-Item -Path $tmp -Destination $Path -Force -ErrorAction Stop
+        } catch {
+            Copy-Item -Path $tmp -Destination $Path -Force
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        }
+        return $true
+    } catch {
+        try { Add-Content -Path $ErrorLogPath -Value "$(Get-Date -f 'HH:mm:ss') Write-JsonFile ERROR [$Path]: $_" -Encoding UTF8 } catch {}
+        return $false
+    }
+}
+
+# Null-safe getter dla właściwości PSObject z ConvertFrom-Json z wartością domyślną
+# Zastępuje wzorzec: if ($null -ne $obj.Prop) { [type]$obj.Prop } else { $default }
+function Get-JsonProp {
+    param(
+        [object]$Obj,
+        [string]$Prop,
+        [object]$Default = $null,
+        [type]$Type = $null
+    )
+    if ($null -eq $Obj) { return $Default }
+    try {
+        $val = $Obj.$Prop
+        if ($null -eq $val) { return $Default }
+        if ($Type) { return $val -as $Type }
+        return $val
+    } catch { return $Default }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RAMMANAGER v2.0 + STORAGE MANAGER + THERMAL GUARD
 # RAMManager v2.0 - TRUE SHARED MEMORY (Memory-Mapped Files)
 # NOWOSC: Uzywa Memory-Mapped Files zamiast lokalnego hashtable
@@ -2787,13 +2850,23 @@ $Script:PredictorPath = Join-Path $Script:ConfigDir "LoadPatterns.json"
 $Script:SettingsPath  = Join-Path $Script:ConfigDir "ProgramSettings.json"
 $Script:AILearningPath = Join-Path $Script:ConfigDir "AILearningState.json"
 $Script:ManualBoostDataPath = Join-Path $Script:ConfigDir "ManualBoostData.json"
-# === READ MANUAL BOOST DATA (user learned preferences) ===
+# REFACTOR 4: Read-ManualBoostData — cache oparty na mtime pliku (30s TTL)
+# Poprzednio: odczyt z dysku przy każdym wywołaniu Get-LearnedPreferenceForApp (co tick!)
+# Teraz: odczyt tylko gdy plik się zmienił lub minęło 30s
+$Script:_MBDCache       = $null
+$Script:_MBDCacheMtime  = [DateTime]::MinValue
+$Script:_MBDCacheCheck  = [DateTime]::MinValue
 function Read-ManualBoostData {
-    if (-not (Test-Path $Script:ManualBoostDataPath)) { return $null }
-    try {
-        $json = [System.IO.File]::ReadAllText($Script:ManualBoostDataPath, [System.Text.Encoding]::UTF8)
-        return $json | ConvertFrom-Json
-    } catch { return $null }
+    $now = [DateTime]::Now
+    # Sprawdzaj mtime max raz na 5s (sam stat() jest tani, ale nie za każdy tick)
+    if (($now - $Script:_MBDCacheCheck).TotalSeconds -lt 5) { return $Script:_MBDCache }
+    $Script:_MBDCacheCheck = $now
+    if (-not (Test-Path $Script:ManualBoostDataPath)) { $Script:_MBDCache = $null; return $null }
+    $mtime = (Get-Item $Script:ManualBoostDataPath -ErrorAction SilentlyContinue).LastWriteTime
+    if ($mtime -eq $Script:_MBDCacheMtime -and $Script:_MBDCache) { return $Script:_MBDCache }
+    $Script:_MBDCache      = Read-JsonFile $Script:ManualBoostDataPath
+    $Script:_MBDCacheMtime = $mtime
+    return $Script:_MBDCache
 }
 # === GET LEARNED PREFERENCE FOR APP ===
 function Get-LearnedPreferenceForApp {
@@ -4896,12 +4969,12 @@ $Script:ProBalanceHistory = [System.Collections.Generic.List[hashtable]]::new()
 $Script:ProBalanceHistoryMaxSize = 60
 function Add-Log {
     param(
-        [string]$Entry, 
+        [string]$Entry,
         [switch]$Debug
     )
     if ([string]::IsNullOrWhiteSpace($Entry)) { return }
-    $time = (Get-Date).ToString("HH:mm:ss")
-    $text = "[$time] $Entry"
+    # REFACTOR 5: [DateTime]::Now.ToString() jest ~3x szybsze niż Get-Date + .ToString()
+    $text = "[{0}] {1}" -f [DateTime]::Now.ToString("HH:mm:ss"), $Entry
     if ($Debug) {
         $Script:DebugLog.Insert(0, $text)
         while ($Script:DebugLog.Count -gt 15) { $Script:DebugLog.RemoveAt(15) }
@@ -9968,27 +10041,28 @@ function Get-UserActivityStatus {
 }
 # Funkcja pomocnicza do pobrania procesu na pierwszym planie
 function Get-ForegroundProcessName {
+    # REFACTOR 3: Cache hwnd — jeśli okno się nie zmieniło, zwróć poprzedni wynik bez Get-Process
     try {
         $hwnd = [Win32]::GetForegroundWindow()
         if ($hwnd -eq [IntPtr]::Zero) { return "" }
+        # Szybka ścieżka: to samo okno co poprzednio — zwróć zakeszowaną nazwę
+        if ($Script:FgCache_Hwnd -eq $hwnd -and $Script:FgCache_Name) {
+            return $Script:FgCache_Name
+        }
         $processId = 0
         [Win32]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
         if ($processId -gt 0) {
             try {
                 $process = Get-Process -Id $processId -ErrorAction Stop
-                if ($process) { 
+                if ($process) {
                     $processName = $process.ProcessName
-                    # #
-                    # IGNORUJ PROCESY SYSTEMOWE NA PIERWSZYM PLANIE
-                    # AI nie reaguje na te procesy nawet gdy sa aktywne
-                    # #
                     if ($Script:BlacklistSet.Contains($processName)) {
                         $process.Dispose()
-                        return "Desktop"  # Traktuj jak Desktop/brak aplikacji
+                        $Script:FgCache_Hwnd = $hwnd
+                        $Script:FgCache_Name = "Desktop"
+                        return "Desktop"
                     }
-                    #  FIXED: Uzyj nowej funkcji Get-ProcessDisplayName (automatyczne nazwy)
                     $friendlyName = Get-ProcessDisplayName -ProcessName $processName -Process $process
-                    # Dla PWA/UWP - sprobuj pobrac prawdziwa nazwe z tytulu okna
                     $pwaProcesses = @("pwahelper", "msedgewebview2", "applicationframehost", "wwahostgta", "wwahost", "electron")
                     if ($pwaProcesses -contains $processName.ToLower() -or $processName -match "helper|host|webview") {
                         $windowTitle = Get-ForegroundWindowTitle
@@ -9999,19 +10073,20 @@ function Get-ForegroundProcessName {
                             }
                         }
                     }
-                    # Zapisz surową nazwę i ścieżkę procesu dla LearnName (anti-race-condition)
-                    $Script:LastFgRawProcName = $processName
-                    $Script:LastFgRawProcPath = $process.Path
+                    $Script:LastFgRawProcName  = $processName
+                    $Script:LastFgRawProcPath  = $process.Path
+                    $Script:FgCache_Hwnd       = $hwnd
+                    $Script:FgCache_Name       = $friendlyName
                     $process.Dispose()
                     return $friendlyName
                 }
-            } catch {
-                return ""
-            }
+            } catch { return "" }
         }
     } catch { }
     return ""
 }
+$Script:FgCache_Hwnd = [IntPtr]::Zero
+$Script:FgCache_Name = ""
 # Deklaracja klasy SmartPriorityManager - FIXED
 class SmartPriorityManager {
     [hashtable] $OriginalPriorities
@@ -20347,24 +20422,17 @@ function Save-State {
     )
     if ($null -eq $Brain -or $null -eq $Prophet) { return $false }
     $success = $true
-    # Powod: Dane Brain moga istniec z poprzedniej sesji - nie tracimy ich
-    try {
-        $brainData = @{
-            Weights = $Brain.Weights
-            AggressionBias = $Brain.AggressionBias
-            ReactivityBias = $Brain.ReactivityBias
-            LastLearned = $Brain.LastLearned
-            LastLearnTime = $Brain.LastLearnTime    # v39 FIX: Dodano brakujace pole
-            TotalDecisions = $Brain.TotalDecisions
-            RAMWeight = $Brain.RAMWeight            # v39 FIX: Dodano brakujace pole
-        }
-        $json = $brainData | ConvertTo-Json -Depth 3 -Compress
-        [System.IO.File]::WriteAllText($Script:BrainPath, $json, [System.Text.Encoding]::UTF8)
-    } catch {
-        # WARN FIX 11: Loguj błąd zapisu zamiast cicho ignorować (utrata danych Brain!)
-        $success = $false
-        try { Add-Content -Path $Script:ErrorLogPath -Value "$(Get-Date -f 'HH:mm:ss') Save-State Brain ERROR: $_" -Encoding UTF8 } catch {}
+    # Brain — zapis przez Write-JsonFile (atomowy tmp→rename + logowanie błędów)
+    $brainData = @{
+        Weights        = $Brain.Weights
+        AggressionBias = $Brain.AggressionBias
+        ReactivityBias = $Brain.ReactivityBias
+        LastLearned    = $Brain.LastLearned
+        LastLearnTime  = $Brain.LastLearnTime
+        TotalDecisions = $Brain.TotalDecisions
+        RAMWeight      = $Brain.RAMWeight
     }
+    if (-not (Write-JsonFile -Path $Script:BrainPath -Data $brainData -Depth 3)) { $success = $false }
     try {
         $prophetData = @{
             Apps = @{}
@@ -20406,10 +20474,10 @@ function Save-State {
                 SessionRuntime = if ($app.ContainsKey('SessionRuntime')) { $app.SessionRuntime } else { 0.0 }
             }
         }
-        # FIX PROPHET-SAVE: Depth 5 ucinał PhasePreferred.Modes.Silent.Count (8 poziomów głębokości)
-        # Depth 10 gwarantuje pełny zapis: prophetData→Apps→app→PhasePreferred→phase→Modes→Silent→Count/Reward
-        $json = $prophetData | ConvertTo-Json -Depth 10 -Compress
-        [System.IO.File]::WriteAllText($Script:ProphetPath, $json, [System.Text.Encoding]::UTF8)
+        # FIX PROPHET-SAVE: Depth 10 gwarantuje pełny zapis PhasePreferred (8 poziomów głębokości)
+        if (-not (Write-JsonFile -Path $Script:ProphetPath -Data $prophetData -Depth 10)) {
+            $success = $false
+        }
     } catch {
         # WARN FIX 11: Loguj błąd zapisu zamiast cicho ignorować (utrata danych Prophet!)
         $success = $false
@@ -20420,103 +20488,99 @@ function Save-State {
 function Load-State {
     $brain = [NeuralBrain]::new()
     $prophet = [ProphetMemory]::new()
-    $gpuBound = [GPUBoundDetector]::new()  # v42.1: GPU-Bound Detector
+    $gpuBound = [GPUBoundDetector]::new()
     if (Test-Path "$Script:ConfigDir\GPUBound.json") { try { $gpuBound.LoadState($Script:ConfigDir) } catch {} }
-    # Powod: Dane Brain moga istniec z poprzedniej sesji - zachowujemy je
-    if (Test-Path $Script:BrainPath) {
-        try {
-            $json = [System.IO.File]::ReadAllText($Script:BrainPath, [System.Text.Encoding]::UTF8)
-            $data = $json | ConvertFrom-Json
-            if ($data.Weights) {
-                $data.Weights.PSObject.Properties | ForEach-Object {
-                    $brain.Weights[$_.Name] = [double]$_.Value
-                }
+    # Brain — Read-JsonFile zwraca $null gdy plik nie istnieje lub jest uszkodzony
+    $data = Read-JsonFile $Script:BrainPath
+    if ($data) {
+        if ($data.Weights) {
+            $data.Weights.PSObject.Properties | ForEach-Object {
+                $brain.Weights[$_.Name] = [double]$_.Value
             }
-            if ($null -ne $data.AggressionBias) { $brain.AggressionBias = [double]$data.AggressionBias }
-            if ($null -ne $data.ReactivityBias) { $brain.ReactivityBias = [double]$data.ReactivityBias }
-            if ($data.LastLearned) { $brain.LastLearned = $data.LastLearned }
-            if ($data.LastLearnTime) { $brain.LastLearnTime = $data.LastLearnTime }  # v39 FIX: Dodano
-            if ($null -ne $data.TotalDecisions) { $brain.TotalDecisions = [int]$data.TotalDecisions }
-            if ($null -ne $data.RAMWeight) { $brain.RAMWeight = [double]$data.RAMWeight }  # v39 FIX: Dodano
-        } catch { }
+        }
+        if ($null -ne $data.AggressionBias) { $brain.AggressionBias  = [double]$data.AggressionBias }
+        if ($null -ne $data.ReactivityBias) { $brain.ReactivityBias  = [double]$data.ReactivityBias }
+        if ($data.LastLearned)              { $brain.LastLearned      = $data.LastLearned }
+        if ($data.LastLearnTime)            { $brain.LastLearnTime    = $data.LastLearnTime }
+        if ($null -ne $data.TotalDecisions) { $brain.TotalDecisions  = [int]$data.TotalDecisions }
+        if ($null -ne $data.RAMWeight)      { $brain.RAMWeight        = [double]$data.RAMWeight }
     }
-    if (Test-Path $Script:ProphetPath) {
-        try {
-            $json = [System.IO.File]::ReadAllText($Script:ProphetPath, [System.Text.Encoding]::UTF8)
-            $data = $json | ConvertFrom-Json
-            if ($data.Apps) {
-                $loadedCount = 0
-                $data.Apps.PSObject.Properties | ForEach-Object {
-                    $appName = $_.Name  # v39 FIX: Zachowaj nazwe PRZED wewnetrzna petla
-                    $appData = $_.Value
-                    $app = @{
-                        Name = $appData.Name
-                        ProcessName = $appData.ProcessName
-                        Launches = [int]$appData.Launches
-                        AvgCPU = [double]$appData.AvgCPU
-                        AvgIO = [double]$appData.AvgIO
-                        MaxCPU = [double]$appData.MaxCPU
-                        MaxIO = [double]$appData.MaxIO
-                        Category = $appData.Category
-                        LastSeen = $appData.LastSeen
-                        # FIX PROPHET-LOAD: ConvertFrom-Json zwraca PSObject[], nie int[] — każdy element castujemy osobno
-                        HourHits = if ($appData.HourHits) { $appData.HourHits | ForEach-Object { [int]$_ } } else { [int[]]::new(24) }
-                        PrevApps = @{}
-                        IsHeavy = [bool]$appData.IsHeavy
-                        IsGPUBound = if ($null -ne $appData.IsGPUBound) { [bool]$appData.IsGPUBound } else { $false }
-                        # WARN FIX 10: Null-safe cast — poszczególne pola ModeHistory/ModeRewards mogą być null po ConvertFrom-Json
-                        ModeHistory = if ($appData.ModeHistory) { @{
-                            Silent   = if ($null -ne $appData.ModeHistory.Silent)   { [int]$appData.ModeHistory.Silent }   else { 0 }
-                            Balanced = if ($null -ne $appData.ModeHistory.Balanced) { [int]$appData.ModeHistory.Balanced } else { 0 }
-                            Turbo    = if ($null -ne $appData.ModeHistory.Turbo)    { [int]$appData.ModeHistory.Turbo }    else { 0 }
-                        }} else { @{ Silent=0; Balanced=0; Turbo=0 } }
-                        ModeRewards = if ($appData.ModeRewards) { @{
-                            Silent   = if ($null -ne $appData.ModeRewards.Silent)   { [double]$appData.ModeRewards.Silent }   else { 0.0 }
-                            Balanced = if ($null -ne $appData.ModeRewards.Balanced) { [double]$appData.ModeRewards.Balanced } else { 0.0 }
-                            Turbo    = if ($null -ne $appData.ModeRewards.Turbo)    { [double]$appData.ModeRewards.Turbo }    else { 0.0 }
-                        }} else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
-                        PreferredMode = if ($appData.PreferredMode) { [string]$appData.PreferredMode } else { "" }
-                        PhasePreferred = @{}
-                        AvgGPU = if ($null -ne $appData.AvgGPU) { [double]$appData.AvgGPU } else { 0.0 }
-                        Samples = if ($appData.Samples) { [int]$appData.Samples } else { 0 }
-                        SessionRuntime = if ($appData.SessionRuntime) { [double]$appData.SessionRuntime } else { 0.0 }
+    # Prophet — Read-JsonFile zwraca $null gdy plik nie istnieje lub uszkodzony
+    $data = Read-JsonFile $Script:ProphetPath
+    if ($data) {
+        if ($data.Apps) {
+            $loadedCount = 0
+            $data.Apps.PSObject.Properties | ForEach-Object {
+                $appName = $_.Name
+                $appData = $_.Value
+                $app = @{
+                    Name          = $appData.Name
+                    ProcessName   = $appData.ProcessName
+                    Launches      = [int]$appData.Launches
+                    AvgCPU        = [double]$appData.AvgCPU
+                    AvgIO         = [double]$appData.AvgIO
+                    MaxCPU        = [double]$appData.MaxCPU
+                    MaxIO         = [double]$appData.MaxIO
+                    Category      = $appData.Category
+                    LastSeen      = $appData.LastSeen
+                    # FIX PROPHET-LOAD: ForEach cast zamiast [int[]] dla PSObject[]
+                    HourHits      = if ($appData.HourHits) { $appData.HourHits | ForEach-Object { [int]$_ } } else { [int[]]::new(24) }
+                    PrevApps      = @{}
+                    IsHeavy       = [bool]$appData.IsHeavy
+                    IsGPUBound    = (Get-JsonProp $appData 'IsGPUBound' $false ([bool]))
+                    AvgGPU        = (Get-JsonProp $appData 'AvgGPU'    0.0   ([double]))
+                    Samples       = (Get-JsonProp $appData 'Samples'   0     ([int]))
+                    SessionRuntime = (Get-JsonProp $appData 'SessionRuntime' 0.0 ([double]))
+                    PreferredMode = if ($appData.PreferredMode) { [string]$appData.PreferredMode } else { "" }
+                    PhasePreferred = @{}
+                    # WARN FIX 10: Null-safe cast per-pole
+                    ModeHistory   = if ($appData.ModeHistory) { @{
+                        Silent   = (Get-JsonProp $appData.ModeHistory 'Silent'   0 ([int]))
+                        Balanced = (Get-JsonProp $appData.ModeHistory 'Balanced' 0 ([int]))
+                        Turbo    = (Get-JsonProp $appData.ModeHistory 'Turbo'    0 ([int]))
+                    }} else { @{ Silent=0; Balanced=0; Turbo=0 } }
+                    ModeRewards   = if ($appData.ModeRewards) { @{
+                        Silent   = (Get-JsonProp $appData.ModeRewards 'Silent'   0.0 ([double]))
+                        Balanced = (Get-JsonProp $appData.ModeRewards 'Balanced' 0.0 ([double]))
+                        Turbo    = (Get-JsonProp $appData.ModeRewards 'Turbo'    0.0 ([double]))
+                    }} else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
+                }
+                if ($appData.PrevApps) {
+                    $appData.PrevApps.PSObject.Properties | ForEach-Object {
+                        $app.PrevApps[$_.Name] = [int]$_.Value
                     }
-                    if ($appData.PrevApps) {
-                        $appData.PrevApps.PSObject.Properties | ForEach-Object {
-                            $prevName = $_.Name  # v39 FIX: Osobna zmienna dla wewnetrznej petli
-                            $app.PrevApps[$prevName] = [int]$_.Value
-                        }
-                    }
-                    if ($appData.PhasePreferred) {
-                        $appData.PhasePreferred.PSObject.Properties | ForEach-Object {
-                            $phaseName = $_.Name
-                            $phaseVal = $_.Value
-                            if ($phaseVal -and $phaseVal.BestMode) {
-                                $app.PhasePreferred[$phaseName] = @{
-                                    BestMode = [string]$phaseVal.BestMode
-                                    TotalCount = if ($null -ne $phaseVal.TotalCount) { [int]$phaseVal.TotalCount } else { 0 }
-                                    Modes = if ($phaseVal.Modes) { @{ Silent=[int]$phaseVal.Modes.Silent; Balanced=[int]$phaseVal.Modes.Balanced; Turbo=[int]$phaseVal.Modes.Turbo } } else { @{ Silent=0; Balanced=0; Turbo=0 } }
-                                }
+                }
+                if ($appData.PhasePreferred) {
+                    $appData.PhasePreferred.PSObject.Properties | ForEach-Object {
+                        $phaseName = $_.Name
+                        $phaseVal  = $_.Value
+                        if ($phaseVal -and $phaseVal.BestMode) {
+                            $app.PhasePreferred[$phaseName] = @{
+                                BestMode   = [string]$phaseVal.BestMode
+                                TotalCount = (Get-JsonProp $phaseVal 'TotalCount' 0 ([int]))
+                                Modes      = if ($phaseVal.Modes) { @{
+                                    Silent   = (Get-JsonProp $phaseVal.Modes 'Silent'   0 ([int]))
+                                    Balanced = (Get-JsonProp $phaseVal.Modes 'Balanced' 0 ([int]))
+                                    Turbo    = (Get-JsonProp $phaseVal.Modes 'Turbo'    0 ([int]))
+                                }} else { @{ Silent=0; Balanced=0; Turbo=0 } }
                             }
                         }
                     }
-                    $prophet.Apps[$appName] = $app  # v39 FIX: Uzywaj zachowanej nazwy
-                    $loadedCount++
                 }
-                Write-Host "  Prophet: Loaded $loadedCount apps from ProphetMemory.json" -ForegroundColor Green
-            } else {
-                Write-Host "  Prophet: Apps section empty or missing in ProphetMemory.json" -ForegroundColor Yellow
+                $prophet.Apps[$appName] = $app
+                $loadedCount++
             }
-            if ($data.LastActiveApp) { $prophet.LastActiveApp = $data.LastActiveApp }
-            if ($null -ne $data.TotalSessions) { $prophet.TotalSessions = [int]$data.TotalSessions }
-            # FIX PROPHET-LOAD: HourlyActivity — ConvertFrom-Json zwraca PSObject[], castujemy element po elemencie
-            if ($data.HourlyActivity) { $prophet.HourlyActivity = @($data.HourlyActivity | ForEach-Object { [int]$_ }) }
-            if ($data.MinSamplesForConfidence) { $prophet.MinSamplesForConfidence = [int]$data.MinSamplesForConfidence }
-        } catch {
-            Write-Host "  Prophet: Load error - $_" -ForegroundColor Red
+            Write-Host "  Prophet: Loaded $loadedCount apps from ProphetMemory.json" -ForegroundColor Green
+        } else {
+            Write-Host "  Prophet: Apps section empty or missing in ProphetMemory.json" -ForegroundColor Yellow
         }
+        if ($data.LastActiveApp)          { $prophet.LastActiveApp          = $data.LastActiveApp }
+        if ($null -ne $data.TotalSessions){ $prophet.TotalSessions          = [int]$data.TotalSessions }
+        # FIX PROPHET-LOAD: HourlyActivity — ForEach cast
+        if ($data.HourlyActivity)         { $prophet.HourlyActivity         = @($data.HourlyActivity | ForEach-Object { [int]$_ }) }
+        if ($data.MinSamplesForConfidence){ $prophet.MinSamplesForConfidence = [int]$data.MinSamplesForConfidence }
     } else {
-        Write-Host "  Prophet: ProphetMemory.json not found (new installation)" -ForegroundColor Yellow
+        Write-Host "  Prophet: ProphetMemory.json not found or invalid (new installation)" -ForegroundColor Yellow
     }
     return @{ Brain = $brain; Prophet = $prophet; GPUBound = $gpuBound }
 }
