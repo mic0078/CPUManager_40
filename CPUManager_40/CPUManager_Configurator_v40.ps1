@@ -4066,16 +4066,18 @@ foreach ($mode in @("Silent", "Balanced", "Turbo", "Extreme")) {
     $null = New-Label -Parent $gb -Text "Tctl (degC):" -X 530 -Y 28 -Width 70 -Height 22
     $numTctl = New-NumericUpDown -Parent $gb -X 605 -Y 25 -Min 60 -Max 105 -Value $tdpData.Tctl -Width 70
     $toolTip.SetToolTip($numTctl, "- Tctl - maksymalna temperatura CPU. Gdy zostanie osiagnieta, procesor sie zaduszka.")
-    $btnApply = New-Button -Parent $gb -Text "Apply Now" -X 700 -Y 22 -Width 100 -Height 30 -BackColor $Script:Colors.AccentDim -ForeColor $Script:Colors.TextBright
+    $btnApply = New-Button -Parent $gb -Text "Stage Profile" -X 700 -Y 22 -Width 100 -Height 30 -BackColor $Script:Colors.AccentDim -ForeColor $Script:Colors.TextBright
     $btnApply.Tag = $mode
-    $toolTip.SetToolTip($btnApply, " Natychmiast stosuje profil TDP $mode do procesora przez RyzenAdj. Zmiana nastapi od razu!")
+    $toolTip.SetToolTip($btnApply, "Zatwierdza wartosci dla profilu $mode w pamieci. Kliknij 'Save and Apply All Profiles' aby zapisac do pliku i zastosowac w ENGINE.")
     $btnApply.Add_Click({
         $m = $this.Tag
         $s = [int]$Script:TDPControls[$m].STAPM.Value; $f = [int]$Script:TDPControls[$m].Fast.Value
         $sl = [int]$Script:TDPControls[$m].Slow.Value; $t = [int]$Script:TDPControls[$m].Tctl.Value
-        if (Set-RyzenAdjTDP -STAPM $s -Fast $f -Slow $sl -Tctl $t) {
-            [System.Windows.Forms.MessageBox]::Show("TDP applied: STAPM=${s}W Fast=${f}W Slow=${sl}W Tctl=${t}C", "Success", "OK", "Information")
-        } else { [System.Windows.Forms.MessageBox]::Show("Failed to apply TDP!", "Error", "OK", "Error") }
+        [System.Windows.Forms.MessageBox]::Show(
+            "Profil $m przygotowany:`nSTAPM=${s}W   Fast=${f}W   Slow=${sl}W   Tctl=${t}C`n`nKliknij 'Save and Apply All Profiles' aby zapisac wszystkie profile i zastosowac w ENGINE.",
+            "Profil $m - gotowy do zapisu",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information)
     })
     $Script:TDPControls[$mode] = @{ STAPM = $numSTAPM; Fast = $numFast; Slow = $numSlow; Tctl = $numTctl }
     $tdpY += 80
