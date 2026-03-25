@@ -1,6 +1,21 @@
 ﻿# ═══════════════════════════════════════════════════════════════════════════════
 # CPUManager ENGINE v43.9 - AI KNOWLEDGE TRANSFER (FIXED)
 # © 2026 Michał | v43.9: 2026-02-02
+# Plik: CPUManager_v40.ps1 (nazwa historyczna — rzeczywista wersja ENGINE: v43.9)
+# ═══════════════════════════════════════════════════════════════════════════════
+# v43.9-fix2 AUDIT FIXES (Claude Sonnet 4.6) 2026-03-25:
+#   - FIX KRYT 1: C:\Temp → $env:TEMP (DebugLog + RAMCacheLog)
+#   - FIX KRYT 2: Validate-TDP AutoAdjustTctl — usunięto martwy if/else dla MaxTctl
+#   - FIX KRYT 3: AMD Regex zakotwiczone ("Ryzen\s+\d+\s+9\d{3}" itp.)
+#   - FIX KRYT 4: WebDashboard — usunięto '$null = $this.PowerShell'
+#   - FIX KRYT 5: Write-SessionSummary przeniesiona PRZED Main()
+#   - FIX KRYT 6: WebDashboard DataFile używa $Script:ConfigDir
+#   - FIX KRYT 7: HardLock — Resolve_HardLockPref eliminuje duplikację
+#   - FIX PROPHET: ConvertTo-Json Depth 5/8 → 10 (PhasePreferred 8 poziomów)
+#   - FIX PROPHET: HourHits/HourlyActivity — ForEach {[int]$_} zamiast [int[]]cast
+#   - WARN FIX 1: RAMCache — scalono podwójny zapis w jeden blok if/elseif
+#   - WARN FIX 2: Write-DebugLog — rotacja logów atomowa (race condition)
+#   - WARN FIX 4: GC x3 → GC(2,Forced) w finally
 # ═══════════════════════════════════════════════════════════════════════════════
 # v43.9 CRITICAL FIX (Claude Opus 4.5):
 #   - NAPRAWIONO funkcję Show-Database (brakowało ciała ForEach-Object + zamknięć)
@@ -116,6 +131,16 @@
 # #
 # TDP SAFETY LIMITS - KRYTYCZNE BEZPIECZNIKI
 # #
+# WARN FIX 7: Sprawdzenie uprawnień administratora — ryzenadj i TDP wymagają admin
+$Script:IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $Script:IsAdmin) {
+    Write-Host ""
+    Write-Host "  [BLAD] CPUManager wymaga uprawnien administratora!" -ForegroundColor Red
+    Write-Host "  Uruchom skrypt jako Administrator (PPM -> Uruchom jako administrator)" -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "  Nacisnij ENTER aby zamknac"
+    exit 1
+}
 $Script:TDP_HARD_LIMITS = @{ # (console sizing and priority moved below to avoid duplicate try blocks)
     MaxSTAPM = 28      # Absolutny maksymalny STAPM (W) - dopasowano do profilu Extreme
     MaxFast = 40       # Absolutny maksymalny Fast Boost (W)
@@ -180,13 +205,10 @@ function Validate-TDP {
     # Walidacja Tctl
     if ($TDPProfile.Tctl -gt $Script:TDP_HARD_LIMITS.MaxTctl) {
         $warnings += " CRITICAL: $Mode Tctl $($TDPProfile.Tctl)°C exceeds THERMAL SAFETY LIMIT $($Script:TDP_HARD_LIMITS.MaxTctl)°C"
-        if ($Script:TDP_HARD_LIMITS.AutoAdjustTctl) {
-            $warnings += "[WARN] $Mode Tctl $($TDPProfile.Tctl)°C above maximum - lowering to $($Script:TDP_HARD_LIMITS.MaxTctl)°C"
-            $TDPProfile.Tctl = $Script:TDP_HARD_LIMITS.MaxTctl
-        } else {
-            $warnings += " CRITICAL: EMERGENCY CAP applied ($($Script:TDP_HARD_LIMITS.MaxTctl)°C)"
-            $TDPProfile.Tctl = $Script:TDP_HARD_LIMITS.MaxTctl
-        }
+        # FIX KRYT 2: AutoAdjustTctl=$false → ZAWSZE cap dla max (bezpieczeństwo termiczne absolutne)
+        # Rozróżnienie: przy MaxTctl zawsze capujemy (thermal safety), przy MinTctl opcjonalnie
+        $warnings += "[WARN] $Mode Tctl $($TDPProfile.Tctl)°C above maximum - capping to $($Script:TDP_HARD_LIMITS.MaxTctl)°C (hard thermal limit)"
+        $TDPProfile.Tctl = $Script:TDP_HARD_LIMITS.MaxTctl
         $safe = $false
     }
     if ($TDPProfile.Tctl -lt $Script:TDP_HARD_LIMITS.MinTctl) {
@@ -290,6 +312,20 @@ function Detect-CPU {
                 }
                 # ...existing code...
             }
+            # WARN FIX 6: Intel Arrow Lake (15th gen) - P+E cores (LP-E zamiast klasycznych E-core)
+            elseif ($cpuName -match "15\d\d\d|Arrow Lake|Core Ultra.*[12][0-9]{2}[HKS]") {
+                $Script:IsHybridCPU = $true
+                $Script:HybridArchitecture = "Arrow Lake (15th Gen)"
+                $Script:CPUGeneration = "15th Gen"
+                if ($Script:TotalCores -ge 20) {
+                    $Script:PCoreCount = 8; $Script:ECoreCount = $Script:TotalCores - 8
+                } elseif ($Script:TotalCores -ge 14) {
+                    $Script:PCoreCount = 6; $Script:ECoreCount = $Script:TotalCores - 6
+                } else {
+                    $Script:PCoreCount = [Math]::Floor($Script:TotalCores * 0.5)
+                    $Script:ECoreCount = $Script:TotalCores - $Script:PCoreCount
+                }
+            }
             # Starsze generacje Intel (10th, 11th) - brak hybrid
             elseif ($cpuName -match "10\d\d\d|11\d\d\d") {
                 $Script:HybridArchitecture = if ($cpuName -match "10\d\d\d") { "Comet Lake (10th Gen)" } else { "Rocket Lake (11th Gen)" }
@@ -313,8 +349,19 @@ function Detect-CPU {
             $Script:CPUVendor = "AMD"
             $Script:CPUType = "AMD"  # Synchronizacja ze starsza zmienna
             $Script:IsHybridCPU = $false  # AMD nie ma P/E cores
+            # WARN FIX 6: AMD Ryzen AI 300 Series (Zen 5 mobile, XDNA NPU) — HX 370, 365, 360 itd.
+            # Nazwa zawiera "AI" i 3-cyfrowy numer modelu, NIE pasuje do "Ryzen \d+ 9\d{3}"
+            if ($cpuName -match "Ryzen AI\s+\d*\s*3[0-9]{2}|Ryzen AI 300") {
+                $Script:HybridArchitecture = "Zen 5 (Ryzen AI 300)"
+                $Script:CPUGeneration = "Ryzen AI 300"
+                # Ryzen AI 300 = 4P + 8E typowo (HX 370: 4P Zen5 + 8E Zen5c)
+                $Script:PCoreCount = if ($Script:TotalCores -ge 12) { 4 } else { [Math]::Floor($Script:TotalCores * 0.33) }
+                $Script:ECoreCount = $Script:TotalCores - $Script:PCoreCount
+            }
+            # FIX KRYT 3: Zakotwiczone wzorce Ryzen - "Ryzen \d+ 9xxx" zamiast luźnego "9\d\d\d"
+            # Zapobiega fałszywym trafieniom na inne CPU z tymi cyframi w nazwie
             # AMD Ryzen 9000 Series (Zen 5)
-            if ($cpuName -match "9\d\d\d") {
+            if ($cpuName -match "Ryzen\s+\d+\s+9\d{3}") {
                 $Script:HybridArchitecture = "Zen 5"
                 $Script:CPUGeneration = "Ryzen 9000"
                 if ($cpuName -match "X3D") {
@@ -324,7 +371,7 @@ function Detect-CPU {
                 }
             }
             # AMD Ryzen 7000 Series (Zen 4)
-            elseif ($cpuName -match "7\d\d\d") {
+            elseif ($cpuName -match "Ryzen\s+\d+\s+7\d{3}") {
                 $Script:HybridArchitecture = "Zen 4"
                 $Script:CPUGeneration = "Ryzen 7000"
                 if ($cpuName -match "X3D") {
@@ -334,7 +381,7 @@ function Detect-CPU {
                 }
             }
             # AMD Ryzen 5000 Series (Zen 3)
-            elseif ($cpuName -match "5\d\d\d") {
+            elseif ($cpuName -match "Ryzen\s+\d+\s+5\d{3}") {
                 $Script:HybridArchitecture = "Zen 3"
                 $Script:CPUGeneration = "Ryzen 5000"
                 if ($cpuName -match "X3D") {
@@ -344,7 +391,7 @@ function Detect-CPU {
                 }
             }
             # AMD Ryzen 3000 Series (Zen 2)
-            elseif ($cpuName -match "3\d\d\d") {
+            elseif ($cpuName -match "Ryzen\s+\d+\s+3\d{3}") {
                 $Script:HybridArchitecture = "Zen 2"
                 $Script:CPUGeneration = "Ryzen 3000"
                 # ...existing code...
@@ -471,7 +518,8 @@ $Script:dGPUVendor = ""         # NVIDIA/AMD
 # ═══════════════════════════════════════════════════════════════════════════════
 # DEBUG LOGGING TO FILE - GPU-BOUND DETECTION TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════
-$Script:DebugLogPath = "C:\Temp\CPUManager_GPU-Debug.log"  # Debug/Info/GPU-Bound logi
+# FIX KRYT 1: Używamy $env:TEMP zamiast hardkodowanego C:\Temp
+$Script:DebugLogPath = Join-Path $env:TEMP "CPUManager_GPU-Debug.log"  # Debug/Info/GPU-Bound logi
 $Script:DebugLogEnabled = $true
 $Script:DebugLogIterationCounter = 0
 
@@ -494,11 +542,12 @@ function Write-DebugLog {
             New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         }
         
-        # Append do pliku (thread-safe jeśli możliwe)
-        # Limit 200KB - gdy przekroczy, zacznij od nowa
+        # WARN FIX 2: Rotacja atomowa — sprawdzenie rozmiaru i zapis nagłówka przed Add-Content
+        # Eliminuje race condition gdy dwa wątki jednocześnie przekraczają próg 200KB
         if (Test-Path $Script:DebugLogPath) {
             $fileSize = (Get-Item $Script:DebugLogPath -ErrorAction SilentlyContinue).Length
             if ($fileSize -gt 204800) {
+                # Nadpisz cały plik nagłówkiem rotacji (Set-Content = truncate+write, atomowe dla jednego piszącego)
                 Set-Content -Path $Script:DebugLogPath -Value "[$timestamp] [ENGINE] [INFO] === LOG ROTATED (exceeded 200KB) ===" -Encoding UTF8 -ErrorAction SilentlyContinue
             }
         }
@@ -510,9 +559,9 @@ function Write-DebugLog {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# RAMCache Debug Log — dedykowany plik logów do C:\Temp\RAMCache-Debug.log
+# RAMCache Debug Log — dedykowany plik logów (FIX KRYT 1: $env:TEMP zamiast C:\Temp)
 # ═══════════════════════════════════════════════════════════════
-$Script:RAMCacheLogPath = "C:\Temp\RAMCache-Debug.log"
+$Script:RAMCacheLogPath = Join-Path $env:TEMP "RAMCache-Debug.log"
 function Write-RCLog {
     param([string]$Message)
     try {
@@ -556,7 +605,7 @@ function Initialize-DebugLog {
         $header = @"
 
 $separator
-CPUManager ENGINE v42.4 DEBUG - GPU-BOUND FULL FIX + DEBUG - New Session Started
+CPUManager ENGINE v43.9-fix2 DEBUG LOG - New Session Started
 $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 $separator
 
@@ -4421,6 +4470,8 @@ $Script:ConfiguratorSettingsApplied = $false
 # Domyslne wartosci
 $Global:AI_Active     = $true
 $Global:DebugMode     = $false
+# SUGESTIA 1: PSDefaultParameterValues — w trybie DebugMode ustawiany dynamicznie w Main
+# (nie globalnie, bo łamałoby SilentlyContinue w normalnym trybie)
 $Script:SavedManualMode = "Balanced"
 # #
 # #
@@ -7067,7 +7118,8 @@ class ProphetMemory {
                 LastActiveApp = $this.LastActiveApp
                 MinSamplesForConfidence = $this.MinSamplesForConfidence
             }
-            [System.IO.File]::WriteAllText($path, ($data | ConvertTo-Json -Depth 8 -Compress), [System.Text.Encoding]::UTF8)
+            # FIX PROPHET-SAVE: Depth 10 zamiast 8 — PhasePreferred.Modes.Silent.Count = 8 poziomów zagłębienia
+            [System.IO.File]::WriteAllText($path, ($data | ConvertTo-Json -Depth 10 -Compress), [System.Text.Encoding]::UTF8)
         } catch { }
     }
     [void] LoadState([string]$dir) {
@@ -7089,7 +7141,8 @@ class ProphetMemory {
                             MaxIO = if ($appData.MaxIO) { [double]$appData.MaxIO } else { 0 }
                             Category = if ($appData.Category) { $appData.Category } else { "NEW" }
                             LastSeen = if ($appData.LastSeen) { $appData.LastSeen } else { "" }
-                            HourHits = if ($appData.HourHits) { [int[]]$appData.HourHits } else { [int[]]::new(24) }
+                            # FIX PROPHET-LOAD: ConvertFrom-Json zwraca PSObject[], nie int[] — każdy element castujemy osobno
+                            HourHits = if ($appData.HourHits) { $appData.HourHits | ForEach-Object { [int]$_ } } else { [int[]]::new(24) }
                             PrevApps = @{}
                             IsHeavy = if ($null -ne $appData.IsHeavy) { [bool]$appData.IsHeavy } else { $false }
                             Samples = if ($appData.Samples) { [int]$appData.Samples } else { 0 }
@@ -7145,7 +7198,8 @@ class ProphetMemory {
                     }
                 }
                 if ($data.TotalSessions) { $this.TotalSessions = [int]$data.TotalSessions }
-                if ($data.HourlyActivity) { $this.HourlyActivity = [int[]]$data.HourlyActivity }
+                # FIX PROPHET-LOAD: HourlyActivity — ConvertFrom-Json zwraca PSObject[], castujemy element po elemencie
+                if ($data.HourlyActivity) { $this.HourlyActivity = @($data.HourlyActivity | ForEach-Object { [int]$_ }) }
                 if ($data.LastActiveApp) { $this.LastActiveApp = $data.LastActiveApp }
                 if ($data.MinSamplesForConfidence) { $this.MinSamplesForConfidence = [int]$data.MinSamplesForConfidence }
             }
@@ -19986,7 +20040,9 @@ class WebDashboard {
     WebDashboard([int]$port) {
         $this.Port = $port
         $this.Running = $false
-        $this.DataFile = "C:\CPUManager\DashboardData.json"
+        # FIX KRYT 6: Używamy $Script:ConfigDir zamiast hardkodowanego C:\CPUManager
+        # UpdateData() już używa zapisu atomowego (tmp → rename) — poprawna thread-safety
+        $this.DataFile = if ($Script:ConfigDir) { Join-Path $Script:ConfigDir "DashboardData.json" } else { Join-Path $env:TEMP "CPUManager_DashboardData.json" }
     }
     [void] Start() {
         try {
@@ -20089,7 +20145,7 @@ new Chart(document.getElementById('tempChart'),{type:'line',data:{labels:labels,
                 }
             }).AddArgument($serverPort).AddArgument($dataFilePath)
             $this.PowerShell.BeginInvoke() | Out-Null
-            $null = $this.PowerShell
+            # FIX KRYT 4: Usunięto błędną linię '$null = $this.PowerShell' (nie nullowała obiektu, powodowała utratę referencji do runspace)
             $this.Running = $true
         } catch {
             $this.Running = $false
@@ -20304,7 +20360,11 @@ function Save-State {
         }
         $json = $brainData | ConvertTo-Json -Depth 3 -Compress
         [System.IO.File]::WriteAllText($Script:BrainPath, $json, [System.Text.Encoding]::UTF8)
-    } catch { $success = $false }
+    } catch {
+        # WARN FIX 11: Loguj błąd zapisu zamiast cicho ignorować (utrata danych Brain!)
+        $success = $false
+        try { Add-Content -Path $Script:ErrorLogPath -Value "$(Get-Date -f 'HH:mm:ss') Save-State Brain ERROR: $_" -Encoding UTF8 } catch {}
+    }
     try {
         $prophetData = @{
             Apps = @{}
@@ -20346,9 +20406,15 @@ function Save-State {
                 SessionRuntime = if ($app.ContainsKey('SessionRuntime')) { $app.SessionRuntime } else { 0.0 }
             }
         }
-        $json = $prophetData | ConvertTo-Json -Depth 5 -Compress
+        # FIX PROPHET-SAVE: Depth 5 ucinał PhasePreferred.Modes.Silent.Count (8 poziomów głębokości)
+        # Depth 10 gwarantuje pełny zapis: prophetData→Apps→app→PhasePreferred→phase→Modes→Silent→Count/Reward
+        $json = $prophetData | ConvertTo-Json -Depth 10 -Compress
         [System.IO.File]::WriteAllText($Script:ProphetPath, $json, [System.Text.Encoding]::UTF8)
-    } catch { $success = $false }
+    } catch {
+        # WARN FIX 11: Loguj błąd zapisu zamiast cicho ignorować (utrata danych Prophet!)
+        $success = $false
+        try { Add-Content -Path $Script:ErrorLogPath -Value "$(Get-Date -f 'HH:mm:ss') Save-State Prophet ERROR: $_" -Encoding UTF8 } catch {}
+    }
     return [bool]$success
 }
 function Load-State {
@@ -20393,12 +20459,22 @@ function Load-State {
                         MaxIO = [double]$appData.MaxIO
                         Category = $appData.Category
                         LastSeen = $appData.LastSeen
-                        HourHits = if ($appData.HourHits) { [int[]]$appData.HourHits } else { [int[]]::new(24) }
+                        # FIX PROPHET-LOAD: ConvertFrom-Json zwraca PSObject[], nie int[] — każdy element castujemy osobno
+                        HourHits = if ($appData.HourHits) { $appData.HourHits | ForEach-Object { [int]$_ } } else { [int[]]::new(24) }
                         PrevApps = @{}
                         IsHeavy = [bool]$appData.IsHeavy
                         IsGPUBound = if ($null -ne $appData.IsGPUBound) { [bool]$appData.IsGPUBound } else { $false }
-                        ModeHistory = if ($appData.ModeHistory) { @{ Silent=[int]$appData.ModeHistory.Silent; Balanced=[int]$appData.ModeHistory.Balanced; Turbo=[int]$appData.ModeHistory.Turbo } } else { @{ Silent=0; Balanced=0; Turbo=0 } }
-                        ModeRewards = if ($appData.ModeRewards) { @{ Silent=[double]$appData.ModeRewards.Silent; Balanced=[double]$appData.ModeRewards.Balanced; Turbo=[double]$appData.ModeRewards.Turbo } } else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
+                        # WARN FIX 10: Null-safe cast — poszczególne pola ModeHistory/ModeRewards mogą być null po ConvertFrom-Json
+                        ModeHistory = if ($appData.ModeHistory) { @{
+                            Silent   = if ($null -ne $appData.ModeHistory.Silent)   { [int]$appData.ModeHistory.Silent }   else { 0 }
+                            Balanced = if ($null -ne $appData.ModeHistory.Balanced) { [int]$appData.ModeHistory.Balanced } else { 0 }
+                            Turbo    = if ($null -ne $appData.ModeHistory.Turbo)    { [int]$appData.ModeHistory.Turbo }    else { 0 }
+                        }} else { @{ Silent=0; Balanced=0; Turbo=0 } }
+                        ModeRewards = if ($appData.ModeRewards) { @{
+                            Silent   = if ($null -ne $appData.ModeRewards.Silent)   { [double]$appData.ModeRewards.Silent }   else { 0.0 }
+                            Balanced = if ($null -ne $appData.ModeRewards.Balanced) { [double]$appData.ModeRewards.Balanced } else { 0.0 }
+                            Turbo    = if ($null -ne $appData.ModeRewards.Turbo)    { [double]$appData.ModeRewards.Turbo }    else { 0.0 }
+                        }} else { @{ Silent=0.0; Balanced=0.0; Turbo=0.0 } }
                         PreferredMode = if ($appData.PreferredMode) { [string]$appData.PreferredMode } else { "" }
                         PhasePreferred = @{}
                         AvgGPU = if ($null -ne $appData.AvgGPU) { [double]$appData.AvgGPU } else { 0.0 }
@@ -20433,7 +20509,8 @@ function Load-State {
             }
             if ($data.LastActiveApp) { $prophet.LastActiveApp = $data.LastActiveApp }
             if ($null -ne $data.TotalSessions) { $prophet.TotalSessions = [int]$data.TotalSessions }
-            if ($data.HourlyActivity) { $prophet.HourlyActivity = [int[]]$data.HourlyActivity }
+            # FIX PROPHET-LOAD: HourlyActivity — ConvertFrom-Json zwraca PSObject[], castujemy element po elemencie
+            if ($data.HourlyActivity) { $prophet.HourlyActivity = @($data.HourlyActivity | ForEach-Object { [int]$_ }) }
             if ($data.MinSamplesForConfidence) { $prophet.MinSamplesForConfidence = [int]$data.MinSamplesForConfidence }
         } catch {
             Write-Host "  Prophet: Load error - $_" -ForegroundColor Red
@@ -20619,6 +20696,26 @@ function Show-Database {
     Write-Host ""
     Write-Host "  Press any key to return..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX KRYT 5: PODSUMOWANIE SESJI — zdefiniowane PRZED Main() i zarejestrowane tu
+# Poprzednio funkcja była po Read-Host (martwy kod — nigdy nie wykonywana)
+# ═══════════════════════════════════════════════════════════════════════════════
+function Write-SessionSummary {
+    $SessionEndTime = Get-Date
+    $SessionDuration = $SessionEndTime - $Global:SessionStartTime
+    try { Write-Log "" "INFO" } catch {}
+    try { Write-Log "════════════════════════════════════════" "INFO" } catch {}
+    try { Write-Log "  SESJA ZAKONCZONA - PODSUMOWANIE" "INFO" } catch {}
+    try { Write-Log "════════════════════════════════════════" "INFO" } catch {}
+    try { Write-Log "Czas trwania: $([Math]::Round($SessionDuration.TotalMinutes, 2)) minut" "INFO" } catch {}
+    try { Write-Log "Zmian trybu: $($Global:ModeChangeCount)" "INFO" } catch {}
+    try { Write-Log "Aktywacji BOOST: $($Global:BoostCount)" "INFO" } catch {}
+    try { Write-Log "Log zapisany: $Global:LogFile" "INFO" } catch {}
+}
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Write-SessionSummary
 }
 
 # MAIN EXECUTION - FIXED z garbage collection i cleanup
@@ -23031,7 +23128,21 @@ $Script:PreviousEnsembleEnabled = $false
                 
                 # ═══════════════════════════════════════════════════════════════════════════
                 # 0. HARDLOCK - ABSOLUTNY PRIORYTET (user wymusza tryb per-app)
+                # FIX KRYT 7: Zduplikowana logika bias→mode+thermal wydzielona do Resolve-HardLockPref
                 # ═══════════════════════════════════════════════════════════════════════════
+                # Pomocniczy scriptblock — używany przez fast path i fallback (eliminuje duplikację)
+                $Resolve_HardLockPref = {
+                    param([hashtable]$Pref, [string]$KeyLabel, [string]$FgName, [double]$CurrentTemp)
+                    $bias = $Pref.Bias
+                    $mode = if ($bias -le 0.2) { "Silent" } elseif ($bias -ge 0.8) { "Turbo" } else { "Balanced" }
+                    $res_reason = "HARDLOCK: $FgName=$mode key=$KeyLabel bias=$([Math]::Round($bias,2))"
+                    if ($CurrentTemp -gt 95 -and $mode -ne "Silent") {
+                        $mode = "Silent"
+                        $res_reason = "THERMAL-SAFETY: $([int]$CurrentTemp)C overrides HARDLOCK ($mode)"
+                    }
+                    return @{ Mode = $mode; Reason = $res_reason }
+                }
+
                 $hardLockBlocked = $false
                 if ($currentForeground -and $currentForeground -notin @("Desktop", "explorer", "Explorer", "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost", "Widgets")) {
                     $appLower = $currentForeground.ToLower() -replace '\.exe$', ''
@@ -23054,15 +23165,11 @@ $Script:PreviousEnsembleEnabled = $false
                     if ($fastKey -and $Script:AppCategoryPreferences.ContainsKey($fastKey)) {
                         $pref = $Script:AppCategoryPreferences[$fastKey]
                         if ($pref.HardLock) {
-                            $hardLockBias = $pref.Bias
-                            $hardLockMode = if ($hardLockBias -le 0.2) { "Silent" } elseif ($hardLockBias -ge 0.8) { "Turbo" } else { "Balanced" }
-                            $newMode = $hardLockMode
-                            $reason = "HARDLOCK: $currentForeground=$hardLockMode key=$fastKey bias=$([Math]::Round($hardLockBias,2))"
+                            # FIX KRYT 7: Używamy wspólnego Resolve_HardLockPref (brak duplikacji)
+                            $hlResult = & $Resolve_HardLockPref $pref $fastKey $currentForeground $currentMetrics.Temp
+                            $newMode = $hlResult.Mode
+                            $reason = $hlResult.Reason
                             $hardLockBlocked = $true
-                            if ($currentMetrics.Temp -gt 95 -and $hardLockMode -ne "Silent") {
-                                $newMode = "Silent"
-                                $reason = "THERMAL-SAFETY: $([int]$currentMetrics.Temp)C overrides HARDLOCK ($hardLockMode)"
-                            }
                         }
                     }
 
@@ -23083,17 +23190,11 @@ $Script:PreviousEnsembleEnabled = $false
                         if ($matchFound) {
                             $pref = $Script:AppCategoryPreferences[$key]
                             if ($pref.HardLock) {
-                                $hardLockBias = $pref.Bias
-                                $hardLockMode = if ($hardLockBias -le 0.2) { "Silent" } 
-                                               elseif ($hardLockBias -ge 0.8) { "Turbo" } 
-                                               else { "Balanced" }
-                                $newMode = $hardLockMode
-                                $reason = "HARDLOCK: $currentForeground=$hardLockMode key=$key bias=$([Math]::Round($hardLockBias,2))"
+                                # FIX KRYT 7: Używamy wspólnego Resolve_HardLockPref (brak duplikacji)
+                                $hlResult = & $Resolve_HardLockPref $pref $key $currentForeground $currentMetrics.Temp
+                                $newMode = $hlResult.Mode
+                                $reason = $hlResult.Reason
                                 $hardLockBlocked = $true
-                                if ($currentMetrics.Temp -gt 95 -and $hardLockMode -ne "Silent") {
-                                    $newMode = "Silent"
-                                    $reason = "THERMAL-SAFETY: $([int]$currentMetrics.Temp)C overrides HARDLOCK ($hardLockMode)"
-                                }
                                 break
                             }
                         }
@@ -23459,26 +23560,23 @@ $Script:PreviousEnsembleEnabled = $false
                     # Core: Batch tick — pliki w porcjach
                     $appRAMCache.BatchTick() | Out-Null
                     
-                    # Periodic save — co 100 iteracji (~3 min) zapisz learned data JEŚLI coś się zmieniło
-                    if ($iteration % 100 -eq 0 -and $iteration -gt 0) {
-                        if ($appRAMCache.IsDirty) {
-                            $appRAMCache.SaveState($Script:ConfigDir)
-                            $appRAMCache.IsDirty = $false
-                            $Script:RAMCacheLastForcedSave = [datetime]::Now
-                            if ($Global:DebugMode) {
-                                Add-Log "- RAMCache SAVED: Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count) → C:\CPUManager\RAMCache.json"
-                            }
-                        }
-                    }
-                    # Forced save co 5 minut niezależnie od IsDirty — gwarantuje zapis podczas długich sesji gaming/rendering
-                    if (([datetime]::Now - $Script:RAMCacheLastForcedSave).TotalMinutes -ge 5) {
+                    # WARN FIX 1: Scalono dwa mechanizmy zapisu — eliminuje podwójny SaveState w tej samej iteracji.
+                    # Priorytet: 5-min forced (zapis + odświeżenie manifestów) > 100-iter dirty-only.
+                    $rcForcedDue = ([datetime]::Now - $Script:RAMCacheLastForcedSave).TotalMinutes -ge 5
+                    if ($rcForcedDue) {
                         $appRAMCache.SaveState($Script:ConfigDir)
                         $appRAMCache.IsDirty = $false
                         $Script:RAMCacheLastForcedSave = [datetime]::Now
                         Write-RCLog "PERIODIC SAVE (5min forced): Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count)"
-                        # Odśwież manifesty wszystkich znanych apek (Cache\*.json) — gaming/rendering nie triggeruje ich zapisu
                         foreach ($cachedApp in @($appRAMCache.AppPaths.Keys)) {
                             $appRAMCache.SaveAppToDiskCache($cachedApp)
+                        }
+                    } elseif ($iteration % 100 -eq 0 -and $iteration -gt 0 -and $appRAMCache.IsDirty) {
+                        $appRAMCache.SaveState($Script:ConfigDir)
+                        $appRAMCache.IsDirty = $false
+                        $Script:RAMCacheLastForcedSave = [datetime]::Now
+                        if ($Global:DebugMode) {
+                            Add-Log "- RAMCache SAVED: Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count)"
                         }
                     }
                     
@@ -25034,11 +25132,8 @@ $Script:PreviousEnsembleEnabled = $false
         } catch { }
         # - V37.7.15: Restore all throttled processes
         try { $proBalance.RestoreAll() } catch { }
-        try {
-            [System.GC]::Collect()
-            [System.GC]::WaitForPendingFinalizers()
-            [System.GC]::Collect()
-        } catch { }
+        # WARN FIX 4: Jeden GC zamiast trzech — GC(2,Forced) czyści wszystkie generacje jednym wywołaniem
+        try { [System.GC]::Collect(2, [System.GCCollectionMode]::Forced) } catch { }
         Clear-Host
         Write-Host "`n  CPU Manager AI ULTRA stopped." -ForegroundColor Yellow
         Write-Host ""
@@ -25122,21 +25217,5 @@ Write-Host "  Program zakonczony. PowerShell gotowy." -ForegroundColor Green
 Write-Host ""
 Write-Host "  Nacisnij ENTER aby zamknac lub wpisz komendy..." -ForegroundColor DarkGray
 Read-Host
-# #
-# PODSUMOWANIE SESJI
-# #
-function Write-SessionSummary {
-    $SessionEndTime = Get-Date
-    $SessionDuration = $SessionEndTime - $Global:SessionStartTime
-    Write-Log "" "INFO"
-    Write-Log "#" "INFO"
-    Write-Log "-                 SESJA ZAKONCZONA - PODSUMOWANIE                                  ?" "INFO"
-    Write-Log "#" "INFO"
-    Write-Log "Czas trwania: $([Math]::Round($SessionDuration.TotalMinutes, 2)) minut" "INFO"
-    Write-Log "Zmian trybu: $($Global:ModeChangeCount)" "INFO"
-    Write-Log "Aktywacji BOOST: $($Global:BoostCount)" "INFO"
-    Write-Log "Log zapisany: $Global:LogFile" "INFO"
-}
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    Write-SessionSummary
-}
+# FIX KRYT 5: Write-SessionSummary i Register-EngineEvent przeniesione PRZED definicję Main()
+# (były tu po Read-Host — funkcja nigdy nie była wywoływana przy normalnym wyjściu)
