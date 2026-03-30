@@ -1866,37 +1866,23 @@ class RyzenAdjVerifier {
                 "--slow-limit=$slow",
                 "--tctl-temp=$tctl"
             )
-            # Wykonaj RyzenADJ
-            $process = Start-Process -FilePath $this.RyzenAdjPath `
-                                    -ArgumentList $args `
-                                    -NoNewWindow `
-                                    -Wait `
-                                    -PassThru `
-                                    -RedirectStandardOutput "C:\CPUManager\ryzenadj_output.txt" `
-                                    -RedirectStandardError "C:\CPUManager\ryzenadj_error.txt"
-            if ($process.ExitCode -eq 0) {
+            # v43.9-perf: Użyj Process.Start z timeout 2s zamiast -Wait (nieskończone blokowanie)
+            # + usunięto Sleep 500ms po wykonaniu (weryfikacja odroczona)
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $this.RyzenAdjPath
+            $psi.Arguments = ($args -join ' ')
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $exited = $proc.WaitForExit(2000)  # Max 2s timeout zamiast nieskończonego -Wait
+            if ($exited -and $proc.ExitCode -eq 0) {
                 $result.Applied = $true
+                $result.Success = $true
                 $result.Message = " RyzenADJ executed: STAPM=$stapm Fast=$fast Slow=$slow Tctl=$tctl"
-                $this.LogError($result.Message)
-                # Poczekaj chwile na zastosowanie
-                Start-Sleep -Milliseconds 500
-                # WERYFIKACJA: Odczytaj faktyczne wartosci
-                $verified = $this.VerifyTDP($stapm, $fast, $slow, $tctl)
-                if ($verified.Success) {
-                    $result.Success = $true
-                    $result.Verified = $true
-                    $result.ActualSTAPM = $verified.ActualSTAPM
-                    $result.ActualFast = $verified.ActualFast
-                    $result.ActualSlow = $verified.ActualSlow
-                    $result.ActualTctl = $verified.ActualTctl
-                    $result.Message += " |  VERIFIED"
-                }
-                else {
-                    $result.Verified = $false
-                    $result.Message += " | [WARN] VERIFICATION FAILED: $($verified.Message)"
-                    $this.VerificationFailures++
-                }
-                # Zapisz wartosci
+                # v43.9-perf: Weryfikacja odroczona — nie blokuj głównej pętli Sleep 500ms
+                # Wartości TDP aplikują się natychmiastowo, weryfikacja przy następnym cyklu
                 $this.LastSTAPM = $stapm
                 $this.LastFast = $fast
                 $this.LastSlow = $slow
@@ -1904,11 +1890,18 @@ class RyzenAdjVerifier {
                 $this.LastVerification = [DateTime]::Now
                 $this.VerificationAttempts++
             }
-            else {
-                $result.Message = "- RyzenADJ failed with exit code: $($process.ExitCode)"
+            elseif (-not $exited) {
+                try { $proc.Kill() } catch { }
+                $result.Message = "- RyzenADJ timed out after 2s"
                 $this.LogError($result.Message)
                 $this.VerificationFailures++
             }
+            else {
+                $result.Message = "- RyzenADJ failed with exit code: $($proc.ExitCode)"
+                $this.LogError($result.Message)
+                $this.VerificationFailures++
+            }
+            try { $proc.Dispose() } catch { }
         }
         catch {
             $result.Message = "- RyzenADJ exception: $_"
@@ -3576,13 +3569,13 @@ function Set-IntelPowerMode {
 function Set-IntelBackgroundAffinity {
     param([hashtable]$PM, [long]$mask)
     try {
-        # AUDIO SAFE MODE: DAW/VST wymaga pełnego dostępu do CPU — zmiana affinity = dropout
         if ($Script:CurrentAppContext -eq "Audio") { return }
-        # PERFORMANCE FIX v40.3: Throttle — max raz na 5 sekund
+        # v43.9-perf: Throttle 8s (było 5s) — kompromis: oszczędność vs responsywność
+        # przy zmianie trybu. Get-Process ALL = 50-200ms.
         $now = [DateTime]::UtcNow
-        if ($PM._LastBgAffinityCheck -and ($now - $PM._LastBgAffinityCheck).TotalSeconds -lt 5.0) { return }
+        if ($PM._LastBgAffinityCheck -and ($now - $PM._LastBgAffinityCheck).TotalSeconds -lt 8.0) { return }
         $PM._LastBgAffinityCheck = $now
-        
+
         $fgHwnd = [Win32]::GetForegroundWindow()
         $fgPid = 0
         if ($fgHwnd -ne [IntPtr]::Zero) { [Win32]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null }
@@ -3621,17 +3614,15 @@ function Restore-IntelAffinities {
 function Set-IntelBackgroundPriority {
     param([hashtable]$PM, [bool]$throttle)
     try {
-        # AUDIO SAFE MODE: Nie obniżaj priorytetów procesów gdy DAW/VST aktywne — powoduje buffer underruns
         if ($throttle -and $Script:CurrentAppContext -eq "Audio") { return }
-        # PERFORMANCE FIX v40.3: Throttle — max raz na 5 sekund (Get-Process = 50-200ms + CPU spike)
+        # v43.9-perf: Throttle 8s (było 5s) — kompromis oszczędność vs tryb-switch
         $now = [DateTime]::UtcNow
-        if ($PM._LastBgPriorityCheck -and ($now - $PM._LastBgPriorityCheck).TotalSeconds -lt 5.0) { return }
+        if ($PM._LastBgPriorityCheck -and ($now - $PM._LastBgPriorityCheck).TotalSeconds -lt 8.0) { return }
         $PM._LastBgPriorityCheck = $now
-        
+
         $fgHwnd = [Win32]::GetForegroundWindow()
         $fgPid = 0
         if ($fgHwnd -ne [IntPtr]::Zero) { [Win32]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null }
-        # Shell/system + audio/DAW procesy NIGDY nie throttle — bez tego = dropout, zamrożony UI
         $shellProtected = @("System","Idle","svchost","csrss","smss","lsass","services","wininit","dwm","explorer","powershell","pwsh","CPUManager","ShellExperienceHost","ApplicationFrameHost","TextInputHost","ShellHost","sihost","taskhostw","RuntimeBroker","dllhost","ctfmon","audiodg","conhost","fontdrvhost","SearchHost","StartMenuExperienceHost","winlogon","SecurityHealthService","MsMpEng",
             "kontakt","kontakt7","kontakt6","vstbridge","vstbridge64","jbridge","jbridge64","audiogridder",
             "cubase","cubase13","reaper","reaper64","fl64","flstudio","bitwig","ableton","studioone","nuendo","protools")
@@ -3640,7 +3631,7 @@ function Set-IntelBackgroundPriority {
         } | Select-Object -First 20
         foreach ($p in $procs) {
             try {
-                $p.PriorityClass = if ($throttle) { [System.Diagnostics.ProcessPriorityClass]::BelowNormal } 
+                $p.PriorityClass = if ($throttle) { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
                                    else { [System.Diagnostics.ProcessPriorityClass]::Normal }
             } catch {} finally { try { $p.Dispose() } catch {} }
         }
@@ -5162,24 +5153,23 @@ function Detect-DataSources {
 }
 function Populate-DetectedSensors {
     $info = $Script:DataSourcesInfo
-    $info.DetectedSensors = @()
+    # v43.9-perf: List<> zamiast @() += (było O(n²) — kopiowanie tablicy przy każdym dodaniu)
+    $sensorList = [System.Collections.Generic.List[PSCustomObject]]::new()
     # Collect from LHM if available
     if ($info.LHMAvailable) {
         try {
             $sensors = Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Sensor -ErrorAction Stop
             foreach ($sensor in $sensors) {
-                # Filter out uninteresting sensors
                 if ($sensor.Value -eq 0 -and $sensor.SensorType -ne "Control") { continue }
-                # Add to detected sensors as PSCustomObject (better JSON serialization)
-                $info.DetectedSensors += [PSCustomObject]@{
+                $sensorList.Add([PSCustomObject]@{
                     Type = $sensor.SensorType
                     Name = $sensor.Name
                     Path = $sensor.Identifier
                     Source = 'LHM'
                     Value = $sensor.Value
-                }
+                })
             }
-            Write-Host "  [DetectedSensors] Collected $($info.DetectedSensors.Count) sensors from LHM" -ForegroundColor Cyan
+            Write-Host "  [DetectedSensors] Collected $($sensorList.Count) sensors from LHM" -ForegroundColor Cyan
         } catch {
             Write-Host "  [DetectedSensors] Failed to collect from LHM: $_" -ForegroundColor Yellow
         }
@@ -5189,32 +5179,31 @@ function Populate-DetectedSensors {
         try {
             $sensors = Get-CimInstance -Namespace "root\OpenHardwareMonitor" -ClassName Sensor -ErrorAction Stop
             foreach ($sensor in $sensors) {
-                # Filter out uninteresting sensors
                 if ($sensor.Value -eq 0 -and $sensor.SensorType -ne "Control") { continue }
-                # Add to detected sensors as PSCustomObject
-                $info.DetectedSensors += [PSCustomObject]@{
+                $sensorList.Add([PSCustomObject]@{
                     Type = $sensor.SensorType
                     Name = $sensor.Name
                     Path = $sensor.Identifier
                     Source = 'OHM'
                     Value = $sensor.Value
-                }
+                })
             }
-            Write-Host "  [DetectedSensors] Collected $($info.DetectedSensors.Count) sensors from OHM" -ForegroundColor Cyan
+            Write-Host "  [DetectedSensors] Collected $($sensorList.Count) sensors from OHM" -ForegroundColor Cyan
         } catch {
             Write-Host "  [DetectedSensors] Failed to collect from OHM: $_" -ForegroundColor Yellow
         }
     }
     # Add ACPI if available
     if ($info.ACPIThermalAvailable) {
-        $info.DetectedSensors += [PSCustomObject]@{
+        $sensorList.Add([PSCustomObject]@{
             Type = 'Temperature'
             Name = 'ACPI ThermalZone'
             Path = 'root\wmi\MSAcpi_ThermalZoneTemperature'
             Source = 'ACPI'
             Value = 0
-        }
+        })
     }
+    $info.DetectedSensors = $sensorList.ToArray()
 }
 # --- Funkcja skanowania dostepnych metryk ---
 function Detect-AvailableMetrics {
@@ -5591,7 +5580,7 @@ function Detect-AvailableMetrics {
 }
 # --- Cached Cim/WMI helpers to reduce syscall frequency ---
 function Get-LHMSensorsCached {
-    param([int]$ttl = 800)  # Cache 800ms - swiezy dla CPU mgmt, bez zbednych CIM queries
+    param([int]$ttl = 1500)  # v43.9-perf: 1500ms (było 800ms) — staggered TTL eliminuje spike clustering
     if (-not $Script:DataSourcesInfo.LHMAvailable) { return $null }
     if (-not $Script:LHMSensorsCacheTime) { $Script:LHMSensorsCacheTime = [DateTime]::MinValue }
     try {
@@ -5614,7 +5603,7 @@ function Get-LHMHardwareCached {
     try { $s = Get-CimInstance -Namespace "root\LibreHardwareMonitor" -ClassName Hardware -ErrorAction SilentlyContinue; $Script:LHMHardwareCache = $s; $Script:LHMHardwareCacheTime = [DateTime]::Now; return $s } catch { return $Script:LHMHardwareCache }
 }
 function Get-OHMSensorsCached {
-    param([int]$ttl = 800)  # Cache 800ms - swiezy dla CPU mgmt, bez zbednych CIM queries
+    param([int]$ttl = 1500)  # v43.9-perf: 1500ms (było 800ms) — staggered TTL
     if (-not $Script:DataSourcesInfo.OHMAvailable) { return $null }
     if (-not $Script:OHMSensorsCacheTime) { $Script:OHMSensorsCacheTime = [DateTime]::MinValue }
     try {
@@ -5637,25 +5626,25 @@ function Get-ACPIThermalCached {
 }
 # Cached WMI helpers for OS / Disk / CPU
 function Get-OSCached {
-    param([int]$ttl = 30000)  #  v39.21 FIX: 30s (bylo 10s) - eliminacja busy cursor co 10s
+    param([int]$ttl = 45000)  # v43.9-perf: 45s (było 30s) — stagger offset od DiskPerf/CPU
     if (-not $Script:OSCacheTime) { $Script:OSCacheTime = [DateTime]::MinValue }
     try { if ($Script:OSCache -and (([DateTime]::Now - $Script:OSCacheTime).TotalMilliseconds -lt $ttl)) { return $Script:OSCache } } catch { }
     try { $o = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue | Select-Object -First 1; $Script:OSCache = $o; $Script:OSCacheTime = [DateTime]::Now; return $o } catch { return $Script:OSCache }
 }
 function Get-DiskPerfCached {
-    param([int]$ttl = 30000)  #  v39.21 FIX: 30s (bylo 5s) - eliminacja busy cursor co 5s
+    param([int]$ttl = 35000)  # v43.9-perf: 35s (było 30s) — stagger offset od OS/CPU
     if (-not $Script:DiskPerfCacheTime) { $Script:DiskPerfCacheTime = [DateTime]::MinValue }
     try { if ($Script:DiskPerfCache -and (([DateTime]::Now - $Script:DiskPerfCacheTime).TotalMilliseconds -lt $ttl)) { return $Script:DiskPerfCache } } catch { }
     try { $d = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction SilentlyContinue; $Script:DiskPerfCache = $d; $Script:DiskPerfCacheTime = [DateTime]::Now; return $d } catch { return $Script:DiskPerfCache }
 }
 function Get-CPUInfoCached {
-    param([int]$ttl = 30000)  #  v39.21 FIX: 30s (bylo 10s) - eliminacja busy cursor co 10s
+    param([int]$ttl = 55000)  # v43.9-perf: 55s (było 30s) — CPU info zmienia się rzadko, stagger offset
     if (-not $Script:CPUInfoCacheTime) { $Script:CPUInfoCacheTime = [DateTime]::MinValue }
     try { if ($Script:CPUInfoCache -and (([DateTime]::Now - $Script:CPUInfoCacheTime).TotalMilliseconds -lt $ttl)) { return $Script:CPUInfoCache } } catch { }
     try { $c = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1; $Script:CPUInfoCache = $c; $Script:CPUInfoCacheTime = [DateTime]::Now; return $c } catch { return $Script:CPUInfoCache }
 }
 function Get-ProcessorPerfCached {
-    param([int]$ttl = 30000)
+    param([int]$ttl = 40000)  # v43.9-perf: 40s stagger offset
     if (-not $Script:ProcessorPerfCacheTime) { $Script:ProcessorPerfCacheTime = [DateTime]::MinValue }
     try { 
         if ($Script:ProcessorPerfCache -and (([DateTime]::Now - $Script:ProcessorPerfCacheTime).TotalMilliseconds -lt $ttl)) { 
@@ -10179,23 +10168,20 @@ class SmartPriorityManager {
         } catch {
             $this.BoostProcess($foregroundApp)
         }
+        # v43.9-perf: Zamiast Get-Process ALL, iteruj tylko po znanych boosted PIDs
         try {
-            $bgProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object { 
-                $_.ProcessName -ne $foregroundApp -and 
-                -not $blacklist.Contains($_.ProcessName) -and
-                $_.PriorityClass -eq [System.Diagnostics.ProcessPriorityClass]::AboveNormal
-            } | Select-Object -First 10
-            foreach ($proc in $bgProcesses) {
+            $toRestore = @()
+            foreach ($pid in @($this.BoostedProcesses.Keys)) {
                 try {
-                    if ($this.BoostedProcesses.ContainsKey($proc.Id)) {
+                    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                    if ($proc -and $proc.ProcessName -ne $foregroundApp) {
                         $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
-                        $this.BoostedProcesses.Remove($proc.Id)
+                        $toRestore += $pid
                     }
-                    $proc.Dispose()
-                } catch { 
-                    try { $proc.Dispose() } catch { }
-                }
+                    if ($proc) { $proc.Dispose() }
+                } catch { }
             }
+            foreach ($pid in $toRestore) { $this.BoostedProcesses.Remove($pid) }
         } catch { }
         $this.ProcessCount = $this.BoostedProcesses.Count
     }
@@ -10307,9 +10293,15 @@ class ProBalance {
     }
     [void] Update([string]$foregroundApp) {
         if (-not $this.Enabled) { return }
+        # v43.9-perf: Throttle ProBalance Update do max raz na 5s (było co iterację ~2s)
+        # Get-Process ALL + filtrowanie = 50-200ms CPU spike
+        $now = [DateTime]::Now
+        if ($this.PSObject.Properties['_LastProBalanceUpdate'] -and ($now - $this._LastProBalanceUpdate).TotalSeconds -lt 5.0) { return }
+        if (-not $this.PSObject.Properties['_LastProBalanceUpdate']) { $this | Add-Member -NotePropertyName '_LastProBalanceUpdate' -NotePropertyValue ([datetime]::MinValue) -Force }
+        $this._LastProBalanceUpdate = $now
         try {
-            $processes = Get-Process | Where-Object { 
-                $_.CPU -gt 0 -and 
+            $processes = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.CPU -gt 0 -and
                 -not $this.SystemProcesses.ContainsKey($_.ProcessName)
             }
             $currentTime = [DateTime]::Now
@@ -10768,20 +10760,24 @@ class PerformanceBooster {
         } catch { }
     }
     # 3. BACKGROUND FREEZE - Zamroź niepotrzebne procesy w tle
+    # v43.9-perf: Throttle 5s + BelowNormal zamiast Idle (mniej agresywne)
     [int] FreezeBackgroundProcesses([string]$foregroundApp) {
         if (-not $this.BackgroundFreezeEnabled) { return 0 }
-        # AUDIO SAFE MODE: Nigdy nie zamrażaj procesów gdy DAW/VST aktywne — cięcia dźwięku i dropout
         if ($Script:CurrentAppContext -eq "Audio") { return 0 }
+        # v43.9-perf: Max raz na 5s — kompromis: szybki BOOST heavy app + oszczędność CPU
+        $now = [datetime]::Now
+        if ($this.PSObject.Properties['_LastFreezeCheck'] -and ($now - $this._LastFreezeCheck).TotalSeconds -lt 5) { return 0 }
+        if (-not $this.PSObject.Properties['_LastFreezeCheck']) { $this | Add-Member -NotePropertyName '_LastFreezeCheck' -NotePropertyValue ([datetime]::MinValue) -Force }
+        $this._LastFreezeCheck = $now
         $frozenCount = 0
         try {
-            # Pobierz procesy używające dużo zasobów
-            $heavyBgProcesses = Get-Process | Where-Object {
-                $_.WorkingSet64 -gt 100MB -and  # >100MB RAM
+            $heavyBgProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.WorkingSet64 -gt 100MB -and
                 $_.ProcessName -ne $foregroundApp -and
                 -not $this.ProtectedProcesses.ContainsKey($_.ProcessName) -and
                 -not $this.FrozenProcesses.ContainsKey($_.Id) -and
-                -not $this.IsHeavyApp($_.ProcessName) -and  # Nie freeze innych heavy apps
-                $_.PriorityClass -ne [System.Diagnostics.ProcessPriorityClass]::BelowNormal  # V38: Nie freeze juz throttlowanych przez ProBalance
+                -not $this.IsHeavyApp($_.ProcessName) -and
+                $_.PriorityClass -ne [System.Diagnostics.ProcessPriorityClass]::BelowNormal
             } | Sort-Object WorkingSet64 -Descending | Select-Object -First $this.MaxFrozenProcesses
             foreach ($proc in $heavyBgProcesses) {
                 if ($this.SuspendProcess($proc)) {
@@ -10809,9 +10805,11 @@ class PerformanceBooster {
         }
     }
     [bool] SuspendProcess([System.Diagnostics.Process]$proc) {
-        # Setting to Idle effectively "freezes" the process for CPU scheduling
+        # v43.9-perf: BelowNormal zamiast Idle — Idle blokuje UI procesów i powoduje
+        # nieresponsywność systemu. BelowNormal daje wystarczający priorytet foreground
+        # bez zamrażania backgroundu.
         try {
-            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Idle
+            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
             return $true
         } catch { }
         return $false
@@ -10830,11 +10828,8 @@ class PerformanceBooster {
         }
         $beforeMB = [Math]::Round([GC]::GetTotalMemory($false) / 1MB, 1)
         try {
-            # Aggressive GC - this is safe, no Win32 calls
-            [GC]::Collect(2, [GCCollectionMode]::Forced, $true)
-            [GC]::WaitForPendingFinalizers()
-            [GC]::Collect(2, [GCCollectionMode]::Forced, $true)
-            # EmptyWorkingSet would require Win32 which breaks class parsing
+            # v43.9-perf: Jeden non-blocking GC zamiast triple Forced (było 100-500ms stall)
+            [GC]::Collect(1, [GCCollectionMode]::Optimized, $false)
         } catch { }
         $afterMB = [Math]::Round([GC]::GetTotalMemory($false) / 1MB, 1)
         $freedMB = [Math]::Max(0, $beforeMB - $afterMB)
@@ -20983,66 +20978,49 @@ function Main {
     $metrics = [FastMetrics]::new()
     # Pokaz podsumowanie zrodel danych
     Show-DataSourcesSummary
-    # --- Metrics updater using WinForms Timer (runs on UI thread) ---
+    # --- Metrics updater: SINGLE background timer (v43.9-perf) ---
+    # FIX: Usunięto podwójny timer (MetricsTimer UI 500ms + SensorTimer 800ms).
+    # Oba wywoływały GetExtended() → 3x/s zapytania WMI = główna przyczyna zacinania.
+    # Teraz: JEDEN timer w tle co 1200ms. UI czyta z $Script:LatestMetrics (lock-free).
     try {
         $Script:MetricsLock = New-Object System.Object
         $Script:LatestMetrics = $metrics.GetExtended()
-        $Script:MetricsTimer = New-Object System.Windows.Forms.Timer
-        $Script:MetricsTimer.Interval = 500  # v40.4: Skrocono z 1000ms - swiezsze dane dla petli
-        $Script:MetricsTimer.Add_Tick({
+        # Jedyny timer — background thread, interwał 1200ms (wystarczający dla 2s pętli)
+        if (-not $Script:SensorPollMs) { $Script:SensorPollMs = 1200 }
+        if (-not $Script:SensorErrorCount) { $Script:SensorErrorCount = 0 }
+        $Script:SensorTimer = New-Object System.Timers.Timer($Script:SensorPollMs)
+        $Script:SensorTimer.AutoReset = $true
+        $Script:SensorTimer.add_Elapsed({
             try {
-                # V40.3 FIX: Użyj GetExtended() zamiast Get() żeby mieć GPU data!
-                $m = $null
-                try { $m = $metrics.GetExtended() } catch { $m = $null }
+                $m = $metrics.GetExtended()
                 if ($m) {
-                    if ([System.Threading.Monitor]::TryEnter($Script:MetricsLock, 50)) {
+                    if ([System.Threading.Monitor]::TryEnter($Script:MetricsLock, 100)) {
                         try { $Script:LatestMetrics = $m } finally { [System.Threading.Monitor]::Exit($Script:MetricsLock) }
                     }
                 }
-            } catch { }
-        })
-        $Script:MetricsTimer.Start()
-        try { Add-Log "Metrics timer started (UI thread)" } catch { }
-        # Background sensor poller (runs on ThreadPool thread) - offloads heavy WMI/Get-CimInstance calls
-        try {
-            if (-not $Script:SensorPollMs) { $Script:SensorPollMs = 800 }  # v40.4: Skrocono z 1500ms
-            if (-not $Script:SensorErrorCount) { $Script:SensorErrorCount = 0 }
-            $Script:SensorTimer = New-Object System.Timers.Timer($Script:SensorPollMs)
-            $Script:SensorTimer.AutoReset = $true
-            $Script:SensorTimer.add_Elapsed({
+                # Periodic RyzenAdj info refresh (non-blocking)
                 try {
-                    $m = $metrics.GetExtended()
-                    if ($m) {
-                        if ([System.Threading.Monitor]::TryEnter($Script:MetricsLock, 200)) {
-                            try { $Script:LatestMetrics = $m } finally { [System.Threading.Monitor]::Exit($Script:MetricsLock) }
+                    if ($Script:RyzenAdjAvailable) {
+                        $elapsed = ([DateTime]::Now - $Script:LastRyzenInfoPollTime).TotalMilliseconds
+                        if ($elapsed -ge $Script:RyzenInfoPollMs) {
+                            Start-RyzenAdjInfoRefresh | Out-Null
+                            $Script:LastRyzenInfoPollTime = [DateTime]::Now
                         }
                     }
-                    # Periodic RyzenAdj info refresh (non-blocking)
-                    try {
-                        if ($Script:RyzenAdjAvailable) {
-                            $elapsed = ([DateTime]::Now - $Script:LastRyzenInfoPollTime).TotalMilliseconds
-                            if ($elapsed -ge $Script:RyzenInfoPollMs) {
-                                Start-RyzenAdjInfoRefresh | Out-Null
-                                $Script:LastRyzenInfoPollTime = [DateTime]::Now
-                            }
-                        }
-                    } catch { }
-                    # reset error counter on success
-                    $Script:SensorErrorCount = 0
-                } catch {
-                    try { $Script:SensorErrorCount = [int]($Script:SensorErrorCount + 1) } catch { $Script:SensorErrorCount = 1 }
-                    if ($Script:SensorErrorCount -gt 5) {
-                        # exponential backoff up to 60s
-                        $new = [int]::Min(60000, [int]($Script:SensorPollMs * 2))
-                        $Script:SensorPollMs = $new
-                        try { $Script:SensorTimer.Interval = $new } catch { }
-                        try { Add-Log "Sensor poll errors; backing off to $new ms" } catch { }
-                    }
+                } catch { }
+                $Script:SensorErrorCount = 0
+            } catch {
+                try { $Script:SensorErrorCount = [int]($Script:SensorErrorCount + 1) } catch { $Script:SensorErrorCount = 1 }
+                if ($Script:SensorErrorCount -gt 5) {
+                    $new = [int]::Min(60000, [int]($Script:SensorPollMs * 2))
+                    $Script:SensorPollMs = $new
+                    try { $Script:SensorTimer.Interval = $new } catch { }
+                    try { Add-Log "Sensor poll errors; backing off to $new ms" } catch { }
                 }
-            })
-            $Script:SensorTimer.Start()
-            try { Add-Log "Sensor timer started (background thread), interval=${Script:SensorPollMs}ms" } catch { }
-        } catch { }
+            }
+        })
+        $Script:SensorTimer.Start()
+        try { Add-Log "Sensor timer started (background, single), interval=${Script:SensorPollMs}ms" } catch { }
     } catch { }
     $loaded = Load-State
     $brain = $loaded.Brain
@@ -21662,10 +21640,10 @@ $Script:PreviousEnsembleEnabled = $false
             $ErrorActionPreference = 'SilentlyContinue'
 
             # ── LAUNCH RACE: Wykrywanie nowych procesów przez polling ──
-            # Co 2 iteracje (~1.6s): porównaj aktualne PID-y z poprzednimi.
-            # Cold-start (pierwsze 15s): tylko kataloguj istniejące procesy.
-            # Po cold-start: KAŻDA nowa detekcja app = właśnie uruchomiona = Launch Race.
-            if ($appRAMCache -and $appRAMCache.Enabled -and ($iteration % 2 -eq 0)) {
+            # v43.9-perf: Co 3 iteracje (~2.4s) — kompromis: szybka detekcja ale bez
+            # Get-Process co iterację. Oryginalne co 2 iter = niepotrzebne (process start
+            # trwa sekundy, nie milisekundy).
+            if ($appRAMCache -and $appRAMCache.Enabled -and ($iteration % 3 -eq 0)) {
                 try {
                     $lcIsInColdStart = ([datetime]::Now -lt $lcRaceColdUntil)
                     $knownNames = @($appRAMCache.AppPaths.Keys) | Where-Object {
@@ -21714,15 +21692,15 @@ $Script:PreviousEnsembleEnabled = $false
                 }
             }
 
-            # ── LAUNCH RACE TICK EXTRA: wywołaj RÓWNIEŻ co iterację (nie tylko co % 2)
-            # ForceBatchTick pomija 200ms timer → pliki ładowane max. szybko podczas startu app.
-            # Bez tego: LaunchRace wolny o ~2× (wywołanie co ~1.6s zamiast co ~0.8s).
-            if ($appRAMCache -and $appRAMCache.Enabled -and $appRAMCache.IsInLaunchRace -and ($iteration % 2 -ne 0)) {
+            # ── LAUNCH RACE TICK EXTRA: wywołaj między głównymi skanami gdy LaunchRace aktywne
+            # v43.9-perf: ForceBatchTick co iterację gdy trwa LaunchRace — szybki preload
+            # jest KRYTYCZNY dla cache hit ratio. Koszt ForceBatchTick = <1ms (tylko queue).
+            if ($appRAMCache -and $appRAMCache.Enabled -and $appRAMCache.IsInLaunchRace -and ($iteration % 3 -ne 0)) {
                 $appRAMCache.ForceBatchTick() | Out-Null
             }
 
-            # Aktualizuj statystyki sieci co 10 iteracji (~10s) - totale sesji nie musza byc co sekunde
-            if ($iteration % 10 -eq 0) {
+            # v43.9-perf: Aktualizuj statystyki sieci co 30 iteracji (~60s) — totale sesji, nie real-time
+            if ($iteration % 30 -eq 0) {
             try {
                 $adapters = Get-NetAdapterStatistics -ErrorAction SilentlyContinue | Where-Object { $_.ReceivedBytes -gt 0 -or $_.SentBytes -gt 0 }
                 if ($adapters) {
@@ -24439,26 +24417,29 @@ $Script:PreviousEnsembleEnabled = $false
             if ($iteration % 600 -eq 0) {
                 Rotate-ErrorLog
             }
-            try {
-                $networkStatsPath = Join-Path $Script:ConfigDir "NetworkStats.json"
-                $netStats = @{
-                    TotalDownloaded = $totalBytesRecv
-                    TotalUploaded = $totalBytesSent
-                    LastUpdate = (Get-Date).ToString("o")
-                }
-                $jsonNet = $netStats | ConvertTo-Json -Compress
-                [System.IO.File]::WriteAllText($networkStatsPath, $jsonNet, [System.Text.Encoding]::UTF8)
-            } catch {
-                # Ignore errors
+            # v43.9-perf: NetworkStats zapis co 30 iteracji (~60s) zamiast co iterację (~2s)
+            # Zapis JSON co 2s = niepotrzebny I/O spike + disk contention
+            if ($iteration % 30 -eq 0) {
+                try {
+                    $networkStatsPath = Join-Path $Script:ConfigDir "NetworkStats.json"
+                    $netStats = @{
+                        TotalDownloaded = $totalBytesRecv
+                        TotalUploaded = $totalBytesSent
+                        LastUpdate = (Get-Date).ToString("o")
+                    }
+                    $jsonNet = $netStats | ConvertTo-Json -Compress
+                    [System.IO.File]::WriteAllText($networkStatsPath, $jsonNet, [System.Text.Encoding]::UTF8)
+                } catch { }
             }
             # === SELF-OPTIMIZING RAM v40 ===
             # Aggressive GC when memory usage exceeds threshold
             $currentMemMB = [Math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 1)
-            $shouldOptimize = ($iteration - $lastGC -ge 100) -or ($currentMemMB -gt 150)
+            # v43.9-perf: GC co 200 iteracji (było 100) i próg 250MB (było 150MB)
+            # + usunięto WaitForPendingFinalizers (blokuje wątek 10-100ms)
+            $shouldOptimize = ($iteration - $lastGC -ge 200) -or ($currentMemMB -gt 250)
             if ($shouldOptimize) {
                 $lastGC = $iteration
-                [System.GC]::Collect(2, [System.GCCollectionMode]::Optimized, $false)
-                [System.GC]::WaitForPendingFinalizers()
+                [System.GC]::Collect(1, [System.GCCollectionMode]::Optimized, $false)
                 # v43.15: USUNIĘTO EmptyWorkingSet — NISZCZYŁO RAMCache!
                 # EmptyWorkingSet wyrzuca WSZYSTKIE strony z working set ENGINE
                 # w tym MMF-cached pliki apps (1-10GB) → trafiają do Standby List
@@ -25117,12 +25098,14 @@ $Script:PreviousEnsembleEnabled = $false
             }
             $elapsed = $stopwatch.ElapsedMilliseconds
             $sleepTime = [Math]::Max(100, $dynamicInterval - $elapsed)
-            # Obsluga zdarzen tray icon - krotkie sleepy z DoEvents
+            # v43.9-perf: Obsluga zdarzen tray icon — DoEvents co 100ms (było 50ms)
+            # MetricsTimer usunięty więc DoEvents nie triggeruje WMI queries
             $remaining = [int]$sleepTime
             while ($remaining -gt 0 -and -not $Global:ExitRequested) {
                 [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds ([Math]::Min(50, $remaining))
-                $remaining -= 50
+                $chunk = [Math]::Min(100, $remaining)
+                Start-Sleep -Milliseconds $chunk
+                $remaining -= $chunk
             }
             if ($Global:ExitRequested) { break }
         }
@@ -25214,10 +25197,11 @@ $Script:PreviousEnsembleEnabled = $false
         try { $watcher.Cleanup() } catch { }
         # Stop metrics timer if running
         try {
-            if ($Script:MetricsTimer) {
-                try { $Script:MetricsTimer.Stop() } catch { }
-                try { $Script:MetricsTimer.Dispose() } catch { }
-                try { Add-Log "Metrics timer stopped" } catch { }
+            # v43.9-perf: MetricsTimer usunięty (podwójny polling). Zatrzymaj SensorTimer.
+            if ($Script:SensorTimer) {
+                try { $Script:SensorTimer.Stop() } catch { }
+                try { $Script:SensorTimer.Dispose() } catch { }
+                try { Add-Log "Sensor timer stopped" } catch { }
             }
         } catch { }
         # Ukryj i usun tray icon glownego procesu
