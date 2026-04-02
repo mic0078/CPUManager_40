@@ -1,4 +1,4 @@
-﻿# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # CPUManager ENGINE v43.9 - AI KNOWLEDGE TRANSFER (FIXED)
 # © 2026 Michał | v43.9: 2026-02-02
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -15879,14 +15879,10 @@ class AppRAMCache {
     
     # ── NEW: Dirty flag — SaveState only when data changed ──
     [bool] $IsDirty = $false
-
-    # ── Dirty manifests — apps whose Cache JSON needs re-saving ──
-    [System.Collections.Generic.HashSet[string]] $DirtyManifests
     
     AppRAMCache() {
         $this.CachedApps = @{}
         $this.AppPaths = @{}
-        $this.DirtyManifests = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $this.DiskCacheDir = "C:\CPUManager\Cache"
         $this.TotalCachedMB = 0
         $this.MaxAppsInCache = 30
@@ -16285,12 +16281,10 @@ class AppRAMCache {
             }
             
             # FALLBACK: Skanuj katalog jeśli brak learned files
-            # Użyj gameRoot (nie tylko appDir) — gry mają DLL rozrzucone po podkatalogach
             if (-not $usedLearned) {
                 try {
-                    $scanBase = if ($gameRoot -and $gameRoot -ne $appDir) { $gameRoot } else { $appDir }
-                    $dlls = Get-ChildItem -Path $scanBase -Filter "*.dll" -Recurse -Depth 4 -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Length -gt 10KB -and $_.Length -lt 200MB }
+                    $dlls = Get-ChildItem -Path $appDir -Filter "*.dll" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Length -gt 10KB -and $_.Length -lt 100MB }
                     $scoredDlls = foreach ($dll in $dlls) {
                         $weight = 1.0
                         $name = $dll.Name.ToLower()
@@ -16335,7 +16329,7 @@ class AppRAMCache {
                 if ($assetBudget -gt 50MB) {
                     # Skanuj pliki gier/aplikacji: shaders, paki, textury, bazy danych
                     # Użyj gameRoot (nie appDir!) — UE4 paki są w Content/Paks
-                    $assetExts = "*.pak","*.pck","*.bank","*.wem","*.ushaderbytecode","*.shaderbundle","*.upk","*.uasset","*.umap","*.cache","*.dat","*.db","*.sqlite","*.bin","*.oodle","*.bk2","*.bik","*.usm","*.cpk","*.arc","*.bundle","*.forge","*.rpack","*.idx","*.nsa","*.xp3","*.wolf","*.rgss3a","*.dds","*.ktx","*.astc","*.pso","*.cso"
+                    $assetExts = "*.pak","*.pck","*.bank","*.wem","*.ushaderbytecode","*.shaderbundle","*.upk","*.uasset","*.umap","*.cache","*.dat","*.db","*.sqlite","*.bin","*.oodle"
                     $scanDir = if ($gameRoot -and $gameRoot -ne $appDir) { $gameRoot } else { $appDir }
                     $assetFiles = Get-ChildItem -Path $scanDir -Include $assetExts -Recurse -Depth 5 -ErrorAction SilentlyContinue |
                         Where-Object { $_.Length -gt 100KB -and $_.Length -lt 500MB } |
@@ -16379,14 +16373,7 @@ class AppRAMCache {
             LoadComplete = $false
             FilesLoaded = 0
         }
-        # MERGE AppPaths: zachowaj istniejące LearnedFiles, ProfiledAt, ModuleCount
-        # (PreloadApp NIE MOŻE nadpisywać — LearnedFiles z LoadState/ProfileAppModules są cenniejsze)
-        if ($this.AppPaths.ContainsKey($appName)) {
-            $this.AppPaths[$appName].ExePath = $targetPath
-            $this.AppPaths[$appName].Dir = $appDir
-        } else {
-            $this.AppPaths[$appName] = @{ ExePath = $targetPath; Dir = $appDir }
-        }
+        $this.AppPaths[$appName] = @{ ExePath = $targetPath; Dir = $appDir }
         $this.TotalCachedMB += $sizeMB
         $this.TotalPreloads++
         $this.RecordPreloadAttempt($appName)
@@ -16439,9 +16426,9 @@ class AppRAMCache {
                 # Trzymanie Accessor = strony PINNED w RAM (working set ENGINE)
                 # Gdy app startuje → Windows daje jej TE SAME fizyczne strony = instant
                 # ReadAllBytes tworzyło KOPIĘ w managed heap = podwójna pamięć = marnowanie!
-                if ($fileSize -lt 500MB) {
+                if ($fileSize -lt 200MB) {
                     $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
-                        $item.Path, [System.IO.FileMode]::Open, [NullString]::Value, 0, 
+                        $item.Path, [System.IO.FileMode]::Open, $null, 0, 
                         [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
                     $accessor = $mmf.CreateViewAccessor(0, $fileSize, 
                         [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
@@ -16459,14 +16446,7 @@ class AppRAMCache {
                 $this.CachedApps[$appName].FilesLoaded++
                 $bytesThisTick += $fileSize
                 $loaded++
-            } catch {
-                # Loguj TYLKO pierwszy błąd per app per tick
-                if (-not $this.CachedApps[$appName].ContainsKey('_LoggedFail')) {
-                    Write-RCLog "BATCH FAIL '$appName' $($item.Path): $($_.Exception.Message)"
-                    $this.CachedApps[$appName]._LoggedFail = $true
-                }
-                continue
-            }
+            } catch { continue }
         }
         
         # Oznacz completed apps + zapisz na dysk
@@ -16474,7 +16454,6 @@ class AppRAMCache {
             $entry = $this.CachedApps[$appName]
             if (-not $entry.LoadComplete -and $entry.FilesLoaded -ge $entry.FileCount) {
                 $entry.LoadComplete = $true
-                Write-RCLog "BATCH COMPLETE '$appName': $($entry.FilesLoaded)/$($entry.FileCount) files, $($entry.Files.Count) in RAM"
                 # Zapisz ukończoną app na dysk — persistent cache between reboots
                 $this.SaveAppToDiskCache($appName)
             }
@@ -16496,65 +16475,44 @@ class AppRAMCache {
                 Files = [System.Collections.Generic.List[hashtable]]::new()
             }
             
-            # MERGE obu źródeł przez deduplikację po Path (case-insensitive)
-            # Stare podejście "wybierz większe" traciło nowo odkryte moduły!
-            $mergedPaths = [System.Collections.Generic.HashSet[string]]::new(
-                               [System.StringComparer]::OrdinalIgnoreCase)
-            $mergedFiles  = [System.Collections.Generic.List[hashtable]]::new()
+            # Zbierz pliki z OBU źródeł, wybierz BOGATSZE
+            $cachedFiles = [System.Collections.Generic.List[hashtable]]::new()
+            $learnedFiles = [System.Collections.Generic.List[hashtable]]::new()
             
-            # Źródło 1: CachedApps.Files (pliki załadowane do RAM — MMF)
+            # Źródło 1: CachedApps.Files
             if ($this.CachedApps.ContainsKey($appName)) {
                 foreach ($f in $this.CachedApps[$appName].Files) {
-                    if ($f.Path -and -not $mergedPaths.Contains($f.Path) -and
-                        (Test-Path $f.Path -ErrorAction SilentlyContinue)) {
-                        $mergedFiles.Add(@{ Path = [string]$f.Path; Size = [long]$f.SizeBytes; Type = [string]$f.Type })
-                        [void]$mergedPaths.Add($f.Path)
+                    if ($f.Path -and (Test-Path $f.Path -ErrorAction SilentlyContinue)) {
+                        $cachedFiles.Add(@{ Path = [string]$f.Path; Size = [long]$f.SizeBytes; Type = [string]$f.Type })
                     }
                 }
             }
             
-            # Źródło 2: AppPaths.LearnedFiles (odkryte przez ProfileAppModules w runtime)
+            # Źródło 2: AppPaths.LearnedFiles
             if ($this.AppPaths.ContainsKey($appName)) {
                 $ap = $this.AppPaths[$appName]
-                if ($ap.ExePath -and -not $mergedPaths.Contains($ap.ExePath) -and
-                    (Test-Path $ap.ExePath -ErrorAction SilentlyContinue)) {
-                    $mergedFiles.Add(@{ Path = [string]$ap.ExePath; Size = [long](Get-Item $ap.ExePath -EA SilentlyContinue).Length; Type = "exe" })
-                    [void]$mergedPaths.Add($ap.ExePath)
+                if ($ap.ExePath -and (Test-Path $ap.ExePath -ErrorAction SilentlyContinue)) {
+                    $learnedFiles.Add(@{ Path = [string]$ap.ExePath; Size = [long](Get-Item $ap.ExePath -EA SilentlyContinue).Length; Type = "exe" })
                 }
                 if ($ap.ContainsKey('LearnedFiles') -and $ap.LearnedFiles) {
                     foreach ($lf in $ap.LearnedFiles) {
-                        if ($lf.Path -and -not $mergedPaths.Contains($lf.Path) -and
-                            (Test-Path $lf.Path -EA SilentlyContinue)) {
-                            $mergedFiles.Add(@{ Path = [string]$lf.Path; Size = [long]$lf.Size; Type = "learned" })
-                            [void]$mergedPaths.Add($lf.Path)
+                        if ($lf.Path -and $lf.Path -ne $ap.ExePath -and (Test-Path $lf.Path -EA SilentlyContinue)) {
+                            $learnedFiles.Add(@{ Path = [string]$lf.Path; Size = [long]$lf.Size; Type = "learned" })
                         }
                     }
                 }
             }
             
-            # Źródło 3: BatchQueue (pliki zakolejkowane przez PreloadApp, jeszcze nie załadowane)
-            # Bez tego: manifest tworzony ZARAZ po PreloadApp ma tylko exe (BatchTick nie zdążył)
-            foreach ($item in $this.BatchQueue) {
-                if ($item.AppName -eq $appName -and $item.Path -and -not $mergedPaths.Contains($item.Path)) {
-                    if (Test-Path $item.Path -ErrorAction SilentlyContinue) {
-                        $mergedFiles.Add(@{ Path = [string]$item.Path; Size = [long]$item.Size; Type = [string]$item.Type })
-                        [void]$mergedPaths.Add($item.Path)
-                    }
-                }
-            }
-            
-            $manifest.Files = $mergedFiles
+            # Wybierz źródło z WIĘKSZĄ liczbą plików
+            $manifest.Files = if ($cachedFiles.Count -ge $learnedFiles.Count) { $cachedFiles } else { $learnedFiles }
             
             if ($manifest.Files.Count -gt 0) {
                 $totalSize = 0; foreach ($f in $manifest.Files) { $totalSize += $f.Size }
                 $manifest.SizeMB = [Math]::Round($totalSize / 1MB, 1)
-                if (-not (Test-Path $this.DiskCacheDir)) {
-                    [System.IO.Directory]::CreateDirectory($this.DiskCacheDir) | Out-Null
-                }
                 $manifestPath = Join-Path $this.DiskCacheDir "$appName.json"
                 $json = $manifest | ConvertTo-Json -Depth 4 -Compress
                 [System.IO.File]::WriteAllText($manifestPath, $json, [System.Text.Encoding]::UTF8)
-                Write-RCLog "MANIFEST SAVED '$appName': $($manifest.Files.Count) files ($($manifest.SizeMB)MB) → $manifestPath"
+                Write-RCLog "MANIFEST SAVED '$appName': $($manifest.Files.Count) files → $manifestPath"
             }
         } catch {}
     }
@@ -16581,7 +16539,7 @@ class AppRAMCache {
                 $origPath = [string]$f.Path
                 if (-not $origPath -or -not (Test-Path $origPath -ErrorAction SilentlyContinue)) { continue }
                 $fileSize = [long]$f.Size
-                if ($fileSize -le 0 -or $fileSize -gt 500MB) { continue }
+                if ($fileSize -le 0 -or $fileSize -gt 100MB) { continue }
                 $queuedItems.Add(@{
                     AppName = $appName; Path = $origPath; Size = $fileSize; Type = [string]$f.Type
                 })
@@ -16730,7 +16688,6 @@ class AppRAMCache {
         $this.BatchQueue = $remaining
         $this.CachedApps.Remove($appName)
         $this.TotalEvictions++
-        $this.IsDirty = $true
         Write-RCLog "EVICT '$appName' (hits=$($entry.HitCount), wasted=$($entry.HitCount -eq 0), totalEvictions=$($this.TotalEvictions))"
     }
     
@@ -17012,7 +16969,6 @@ class AppRAMCache {
         $wasteRate = if ($this.TotalPreloads -gt 0) { [Math]::Round($this.TotalWastedPreloads / $this.TotalPreloads * 100, 1) } else { 0 }
         
         # Auto-adjust aggressiveness based on performance
-        $oldAggr = $this.Aggressiveness
         if ($totalOps -ge 10) {
             if ($hitRate -gt 70 -and $wasteRate -lt 30) {
                 # Dobre trafienia, mało odpadów → zwiększ agresję
@@ -17022,10 +16978,6 @@ class AppRAMCache {
                 # Słabe trafienia lub dużo odpadów → zmniejsz
                 $this.Aggressiveness = [Math]::Max($this.AggressivenessMin, $this.Aggressiveness - 0.03)
             }
-        }
-        # Jeśli aggressiveness się zmieniło → oznacz dirty żeby zapisać
-        if ([Math]::Abs($this.Aggressiveness - $oldAggr) -gt 0.001) {
-            $this.IsDirty = $true
         }
         
         # Auto-adjust MaxCacheMB — NIGDY nie zmniejszaj poniżej dynamicznego minimum
@@ -17370,10 +17322,7 @@ class AppRAMCache {
         if ([string]::IsNullOrWhiteSpace($appName)) { return }
         try {
             $proc = Get-Process -Name $appName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $proc) { 
-                Write-RCLog "PROFILE SKIP '$appName': process not found"
-                return 
-            }
+            if (-not $proc) { return }
             
             # Pobierz RZECZYWISTE załadowane moduły procesu
             $maxModules = 50  # default
@@ -17386,199 +17335,40 @@ class AppRAMCache {
                 $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue)
             } | Select-Object -First $maxModules
             
-            $modCount = if ($modules) { @($modules).Count } else { 0 }
-            if ($modCount -lt 2) {
-                Write-RCLog "PROFILE SKIP '$appName': only $modCount accessible modules"
-                return 
-            }
+            if ($modules.Count -lt 2) { return }
             
-            # Ensure AppPaths entry exists
-            if (-not $this.AppPaths.ContainsKey($appName)) {
-                $this.AppPaths[$appName] = @{ ExePath = $proc.Path; Dir = [System.IO.Path]::GetDirectoryName($proc.Path) }
-            }
-            
-            # MERGE: zacznij od istniejących LearnedFiles — nie nadpisuj, dołączaj nowe
-            # (aplikacje ładują DLL/assety dynamicznie w trakcie działania, nie tylko na starcie)
-            $ap = $this.AppPaths[$appName]
-            # BUGFIX: PS class if/else expression zwraca $null dla konstruktora generycznego
-            # Musi być oddzielne if/else z osobnym przypisaniem
-            if ($ap.ContainsKey('LearnedFiles') -and $ap.LearnedFiles -and $ap.LearnedFiles.Count -gt 0) {
-                $learnedFiles = $ap.LearnedFiles
-            } else {
-                $learnedFiles = [System.Collections.Generic.List[hashtable]]::new()
-            }
-            # Szybki lookup znanych ścieżek dla deduplication
-            $knownPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            foreach ($lf in $learnedFiles) { [void]$knownPaths.Add($lf.Path) }
-            
-            $newModCount = 0
+            # Zbierz listę plików z rozmiarami
+            $learnedFiles = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($mod in $modules) {
                 try {
-                    if ($knownPaths.Contains($mod.FileName)) { continue }  # już znany — pomiń
                     $size = (Get-Item $mod.FileName -ErrorAction Stop).Length
-                    if ($size -gt 5KB -and $size -lt 500MB) {
+                    if ($size -gt 5KB -and $size -lt 200MB) {
                         $learnedFiles.Add(@{
                             Path = $mod.FileName
                             Size = $size
                             Module = $mod.ModuleName
                         })
-                        [void]$knownPaths.Add($mod.FileName)
-                        $newModCount++
                     }
                 } catch { continue }
             }
             
-            # GAME DIR DLL SCAN: proc.Modules zwraca głównie system DLL (ntdll, kernel32...)
-            # Gry mają istotne DLL w swoim katalogu (plugin, silnik, middleware) — skanuj je
-            $gameDirDllCount = 0
-            try {
-                $appDir2 = [System.IO.Path]::GetDirectoryName($proc.Path)
-                # Game root detection (identyczna jak w PreloadApp/Deep Profile)
-                $gameDir = $appDir2
-                $td = $appDir2
-                for ($u = 0; $u -lt 4; $u++) {
-                    $p = [System.IO.Path]::GetDirectoryName($td)
-                    if (-not $p -or $p -eq $td) { break }
-                    if ((Test-Path (Join-Path $p "Content") -EA SilentlyContinue) -or
-                        (Test-Path (Join-Path $p "Engine") -EA SilentlyContinue) -or
-                        (Get-ChildItem $p -Filter "*.pak" -EA SilentlyContinue | Select-Object -First 1)) {
-                        $gameDir = $p; break
-                    }
-                    $td = $p
-                }
-                # Skanuj DLL w katalogu gry (rekursywnie, max 5 poziomów)
-                # To łapie np. UE4/UE5 engine DLL, middleware (FMOD, Wwise, PhysX), pluginy
-                $gameDlls = Get-ChildItem -Path $gameDir -Filter "*.dll" -Recurse -Depth 5 -EA SilentlyContinue |
-                    Where-Object { $_.Length -gt 10KB -and $_.Length -lt 200MB -and 
-                                   $_.DirectoryName -notmatch '\\(Windows|System32|SysWOW64|WinSxS)\\' } |
-                    Sort-Object Length -Descending | Select-Object -First $maxModules
-                foreach ($dll in $gameDlls) {
-                    if ($knownPaths.Contains($dll.FullName)) { continue }
-                    $learnedFiles.Add(@{ Path = $dll.FullName; Size = $dll.Length; Module = "gamedir:$($dll.Name)" })
-                    [void]$knownPaths.Add($dll.FullName)
-                    $gameDirDllCount++
-                    $newModCount++
-                }
-                if ($gameDirDllCount -gt 0) {
-                    Write-RCLog "GAMEDIR DLL '$appName': +$gameDirDllCount DLLs from $gameDir"
-                }
-            } catch {}
-            
-            Write-RCLog "PROFILE LOOP '$appName': newMod=$newModCount learned=$($learnedFiles.Count) gameDirDll=$gameDirDllCount"
             if ($learnedFiles.Count -lt 2) { return }
             
+            # Zapisz do AppPaths
+            if (-not $this.AppPaths.ContainsKey($appName)) {
+                $this.AppPaths[$appName] = @{ ExePath = $proc.Path; Dir = [System.IO.Path]::GetDirectoryName($proc.Path) }
+            }
             $this.AppPaths[$appName].LearnedFiles = $learnedFiles
             $this.AppPaths[$appName].ProfiledAt = [datetime]::Now
             $this.AppPaths[$appName].ModuleCount = $learnedFiles.Count
-            
-            if ($newModCount -gt 0) {
-                $totalSizeMB = 0; foreach ($f in $learnedFiles) { $totalSizeMB += $f.Size }
-                $totalSizeMB = [Math]::Round($totalSizeMB / 1MB, 1)
-                Write-RCLog "PROFILED '$appName': +$newModCount new modules, total=$($learnedFiles.Count) ($($totalSizeMB)MB)"
-                $this.IsDirty = $true
-                [void]$this.DirtyManifests.Add($appName)  # manifest needs re-save
-            }
-            
-            # ═══════════════════════════════════════════════════════════════
-            # CHILD PROCESSES: skanuj procesy-dzieci głównego procesu
-            # Każde dziecko ładuje własne DLL — muszą być w cache rodzica
-            # przy następnym uruchomieniu aby system był w pełni ciepły.
-            # Dzieci dostają też własny wpis w AppPaths (oddzielny klucz).
-            # ═══════════════════════════════════════════════════════════════
-            $childNewModCount = 0
-            try {
-                $parentPid = $proc.Id
-                $childCimProcs = Get-CimInstance Win32_Process -Filter "ParentProcessId=$parentPid" `
-                    -ErrorAction SilentlyContinue |
-                    Where-Object { $_.ProcessId -ne $parentPid -and $_.Name -notmatch '\.(tmp)$' }
-                
-                foreach ($childCim in $childCimProcs) {
-                    try {
-                        $childProc = Get-Process -Id $childCim.ProcessId -ErrorAction SilentlyContinue
-                        if (-not $childProc -or -not $childProc.Path) { continue }
-                        $childName = $childProc.ProcessName
-                        # Ignoruj systemowe i engine'owe procesy-dzieci
-                        if ($childName -match '^(pwsh|powershell|conhost|svchost|csrss|dwm|WerFault|CrashReportClient|wermgr|rundll32|cmd|msiexec)$') { continue }
-                        
-                        $childModules = @()
-                        try { $childModules = $childProc.Modules | Where-Object {
-                            $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue)
-                        } | Select-Object -First $maxModules } catch {}
-                        
-                        # 1. Dołącz moduły dziecka do profilu RODZICA (wspólny manifest)
-                        foreach ($mod in $childModules) {
-                            try {
-                                if ($knownPaths.Contains($mod.FileName)) { continue }
-                                $size = (Get-Item $mod.FileName -ErrorAction Stop).Length
-                                if ($size -gt 5KB -and $size -lt 200MB) {
-                                    $learnedFiles.Add(@{
-                                        Path   = $mod.FileName
-                                        Size   = $size
-                                        Module = "child:$childName"
-                                    })
-                                    [void]$knownPaths.Add($mod.FileName)
-                                    $childNewModCount++
-                                }
-                            } catch { continue }
-                        }
-                        
-                        # 2. Utwórz/aktualizuj własny AppPaths dziecka (oddzielny klucz)
-                        if ($childModules.Count -ge 2) {
-                            if (-not $this.AppPaths.ContainsKey($childName)) {
-                                $this.AppPaths[$childName] = @{
-                                    ExePath   = $childProc.Path
-                                    Dir       = [System.IO.Path]::GetDirectoryName($childProc.Path)
-                                    ParentApp = $appName
-                                }
-                            }
-                            $childAp    = $this.AppPaths[$childName]
-                            # BUGFIX: PS class if/else expression zwraca $null dla konstruktora generycznego
-                            if ($childAp.ContainsKey('LearnedFiles') -and $childAp.LearnedFiles) {
-                                $childLF = $childAp.LearnedFiles
-                            } else {
-                                $childLF = [System.Collections.Generic.List[hashtable]]::new()
-                            }
-                            $childKnown = [System.Collections.Generic.HashSet[string]]::new(
-                                            [System.StringComparer]::OrdinalIgnoreCase)
-                            foreach ($clf in $childLF) { [void]$childKnown.Add($clf.Path) }
-                            $childAdded = 0
-                            foreach ($mod in $childModules) {
-                                try {
-                                    if ($childKnown.Contains($mod.FileName)) { continue }
-                                    $size = (Get-Item $mod.FileName -ErrorAction Stop).Length
-                                    if ($size -gt 5KB -and $size -lt 200MB) {
-                                        $childLF.Add(@{ Path = $mod.FileName; Size = $size; Module = $mod.ModuleName })
-                                        [void]$childKnown.Add($mod.FileName)
-                                        $childAdded++
-                                    }
-                                } catch { continue }
-                            }
-                            if ($childAdded -gt 0 -or -not $childAp.ContainsKey('LearnedFiles')) {
-                                $this.AppPaths[$childName].LearnedFiles = $childLF
-                                $this.AppPaths[$childName].ProfiledAt   = [datetime]::Now
-                                $this.AppPaths[$childName].ModuleCount  = $childLF.Count
-                                $this.SaveAppToDiskCache($childName)
-                                $this.IsDirty = $true
-                            }
-                        }
-                    } catch { continue }
-                }
-                
-                if ($childNewModCount -gt 0) {
-                    $this.AppPaths[$appName].LearnedFiles = $learnedFiles
-                    $this.AppPaths[$appName].ModuleCount  = $learnedFiles.Count
-                    Write-RCLog "CHILD PROFILE '$appName': +$childNewModCount modules from $($childCimProcs.Count) child proc(s)"
-                    $this.IsDirty = $true
-                    [void]$this.DirtyManifests.Add($appName)  # parent manifest needs re-save
-                }
-            } catch {}
-            
-            # Zapisz manifest — ZAWSZE po profilu jeśli mamy nowe moduły
-            # (wcześniej manifest mógł być zapisany za wcześnie — tylko exe, bez modułów)
+            # Log success
+            $totalSizeMB = 0; foreach ($f in $learnedFiles) { $totalSizeMB += $f.Size }
+            $totalSizeMB = [Math]::Round($totalSizeMB / 1MB, 1)
+            Write-RCLog "PROFILED '$appName': $($learnedFiles.Count) modules ($($totalSizeMB)MB)"
+            $this.IsDirty = $true
             
             # DEEP PROFILE: skanuj katalog app dla asset files (shaders, pak, textures)
             # Zapamiętaj pełny profil — przy ponownym uruchomieniu załaduj WSZYSTKO
-            $assetCount = 0
             try {
                 $appDir = [System.IO.Path]::GetDirectoryName($proc.Path)
                 # Game root detection: UE4/UE5 exe w Binaries/Win64
@@ -17595,16 +17385,18 @@ class AppRAMCache {
                     }
                     $testDir2 = $parent2
                 }
-                $assetExts = "*.pak","*.pck","*.bank","*.wem","*.ushaderbytecode","*.shaderbundle","*.upk","*.uasset","*.umap","*.cache","*.dat","*.bin","*.oodle","*.bk2","*.bik","*.usm","*.cpk","*.arc","*.bundle","*.forge","*.rpack","*.idx","*.nsa","*.xp3","*.wolf","*.rgss3a","*.dds","*.ktx","*.astc","*.pso","*.cso"
+                $assetExts = "*.pak","*.pck","*.bank","*.wem","*.ushaderbytecode","*.shaderbundle","*.upk","*.uasset","*.umap","*.cache","*.dat","*.bin","*.oodle"
                 $assetFiles = Get-ChildItem -Path $scanRoot -Include $assetExts -Recurse -Depth 5 -ErrorAction SilentlyContinue |
                     Where-Object { $_.Length -gt 100KB -and $_.Length -lt 500MB } |
-                    Sort-Object Length -Descending | Select-Object -First 60
+                    Sort-Object Length -Descending | Select-Object -First 40
                 
+                $assetCount = 0
                 $assetSizeMB = 0
                 foreach ($asset in $assetFiles) {
-                    if ($knownPaths.Contains($asset.FullName)) { continue }  # już znany — pomiń
+                    $already = $false
+                    foreach ($lf in $learnedFiles) { if ($lf.Path -eq $asset.FullName) { $already = $true; break } }
+                    if ($already) { continue }
                     $learnedFiles.Add(@{ Path = $asset.FullName; Size = $asset.Length; Module = "asset:$($asset.Name)" })
-                    [void]$knownPaths.Add($asset.FullName)
                     $assetCount++
                     $assetSizeMB += $asset.Length
                 }
@@ -17612,36 +17404,12 @@ class AppRAMCache {
                     $this.AppPaths[$appName].LearnedFiles = $learnedFiles
                     $this.AppPaths[$appName].ModuleCount = $learnedFiles.Count
                     Write-RCLog "DEEP PROFILE '$appName': +$assetCount assets ($([Math]::Round($assetSizeMB/1MB,1))MB), total=$($learnedFiles.Count) files"
-                    $this.IsDirty = $true
-                    [void]$this.DirtyManifests.Add($appName)  # manifest needs re-save
                 }
             } catch {}
             
-            # Zapisz manifest — zawsze po profilu (merge może dodać brakujące pliki z LearnedFiles
-            # których nie było w CachedApps i odwrotnie; zapis idempotentny jeśli nic się nie zmieniło)
-            if ($learnedFiles.Count -gt 0 -or ($this.CachedApps.ContainsKey($appName) -and $this.CachedApps[$appName].Files.Count -gt 0)) {
-                if ($newModCount -gt 0 -or $assetCount -gt 0 -or $childNewModCount -gt 0) {
-                    $this.SaveAppToDiskCache($appName)
-                } elseif ($this.AppPaths.ContainsKey($appName) -and $this.AppPaths[$appName].ContainsKey('LearnedFiles')) {
-                    # Sprawdź czy manifest na dysku jest starszy/uboższy niż LearnedFiles
-                    $diskPath = Join-Path $this.DiskCacheDir "$appName.json"
-                    $diskCount = 0
-                    if (Test-Path $diskPath -ErrorAction SilentlyContinue) {
-                        try {
-                            $diskJson = [System.IO.File]::ReadAllText($diskPath, [System.Text.Encoding]::UTF8)
-                            $diskObj  = $diskJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-                            if ($diskObj -and $diskObj.Files) { $diskCount = $diskObj.Files.Count }
-                        } catch {}
-                    }
-                    $totalKnown = $learnedFiles.Count + $(if ($this.CachedApps.ContainsKey($appName)) { $this.CachedApps[$appName].Files.Count } else { 0 })
-                    if ($totalKnown -gt $diskCount) {
-                        $this.SaveAppToDiskCache($appName)
-                    }
-                }
-            }
-        } catch {
-            Write-RCLog "PROFILE ERROR '$appName': $($_.Exception.Message)"
-        }
+            # Zapisz manifest na dysk od razu po profilowaniu (nie czekaj na LoadComplete)
+            $this.SaveAppToDiskCache($appName)
+        } catch {}
     }
     
     [void] SaveState([string]$configDir) {
@@ -17779,7 +17547,7 @@ class AppRAMCache {
                         $files = [System.Collections.Generic.List[hashtable]]::new()
                         $count = 0
                         foreach ($f in $entry.LearnedFiles) {
-                            if ($count -ge $(if ($this.HW -and $this.HW.CacheStrategy) { $this.HW.CacheStrategy.MaxSavedFiles } else { 120 })) { break }
+                            if ($count -ge $(if ($this.HW -and $this.HW.CacheStrategy) { $this.HW.CacheStrategy.MaxSavedFiles } else { 40 })) { break }
                             if ($f -and $f.Path) {
                                 $files.Add(@{ P = [string]$f.Path; S = [long]$f.Size; M = [string]$f.Module })
                                 $count++
@@ -17833,38 +17601,13 @@ class AppRAMCache {
                 $manifestCount = 0
                 foreach ($app in @($this.AppPaths.Keys)) {
                     $manifestPath = Join-Path $this.DiskCacheDir "$app.json"
-                    $needsSave = $false
                     if (-not (Test-Path $manifestPath)) {
-                        $needsSave = $true
-                    } elseif ($this.DirtyManifests.Contains($app)) {
-                        $needsSave = $true
-                    } else {
-                        # Sprawdź czy manifest na dysku jest uboższy niż dane w pamięci
-                        # (manifest mógł być zapisany za wcześnie — tylko exe, bez LearnedFiles)
-                        $memFileCount = 0
-                        if ($this.AppPaths[$app].ContainsKey('LearnedFiles') -and $this.AppPaths[$app].LearnedFiles) {
-                            $memFileCount += $this.AppPaths[$app].LearnedFiles.Count
-                        }
-                        if ($this.CachedApps.ContainsKey($app) -and $this.CachedApps[$app].Files) {
-                            $memFileCount += $this.CachedApps[$app].Files.Count
-                        }
-                        if ($memFileCount -gt 1) {
-                            try {
-                                $diskJson = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)
-                                $diskObj = $diskJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-                                $diskFileCount = if ($diskObj -and $diskObj.Files) { $diskObj.Files.Count } else { 0 }
-                                if ($memFileCount -gt $diskFileCount) { $needsSave = $true }
-                            } catch { $needsSave = $true }
-                        }
-                    }
-                    if ($needsSave) {
                         $this.SaveAppToDiskCache($app)
                         $manifestCount++
-                        [void]$this.DirtyManifests.Remove($app)
                     }
                 }
                 if ($manifestCount -gt 0) {
-                    Write-RCLog "MANIFESTS: $manifestCount new/updated manifests saved to $($this.DiskCacheDir)"
+                    Write-RCLog "MANIFESTS: $manifestCount new manifests saved to $($this.DiskCacheDir)"
                 }
             }
         } catch {
@@ -20499,15 +20242,8 @@ $Script:PreviousEnsembleEnabled = $false
                                         $appRAMCache.PreloadApp($resolved, $exePath, 1.0) | Out-Null
                                     }
                                 }
-                                # ZAWSZE profiluj moduły na MISS — nawet po LoadAppFromDiskCache
-                                # Manifest może być ubogi (np. tylko exe). ProfileAppModules wykryje
-                                # nowe DLL/moduły i oznaczy manifest jako dirty do ponownego zapisu.
+                                # Profiluj moduły (uczy się DLL → SaveAppToDiskCache przy BatchTick complete)
                                 $appRAMCache.ProfileAppModules($resolved)
-                                # Zapamiętaj czas MISS dla ramp-up profiling interval
-                                if (-not $appRAMCache.AppPaths.ContainsKey($resolved)) {
-                                    $appRAMCache.AppPaths[$resolved] = @{ ExePath = ''; Dir = '' }
-                                }
-                                $appRAMCache.AppPaths[$resolved].FirstMissTime = [datetime]::Now
                             }
                         }
                     }
@@ -21903,34 +21639,14 @@ $Script:PreviousEnsembleEnabled = $false
                     if (-not [string]::IsNullOrWhiteSpace($currentForeground)) {
                         $appRAMCache.UpdateHeavyMode($currentForeground, $currentMetrics.CPU, $ctxGpuLoad, $prophetApps)
                     }
-                    # Profile app modules — skanuj RZECZYWISTE moduły foreground app
-                    # Nowe app: co 30 iteracji (~90s) — wychwytuj moduły ładowane na starcie
-                    # Znane app: co 150 iteracji (~7.5 min) — wychwytuj moduły ładowane w runtime
-                    # Merge w ProfileAppModules deduplikuje — bezpieczne wywoływać wielokrotnie
-                    # BUGFIX: $currentForeground to DisplayName (np. "Silent Hill 2"), nie ProcessName.
-                    # ProfileAppModules wymaga ProcessName dla Get-Process — użyj ResolveAppName.
-                    if (-not [string]::IsNullOrWhiteSpace($currentForeground)) {
-                        $resolvedFg = $appRAMCache.ResolveAppName($currentForeground)
-                        $hasLearned = ($appRAMCache.AppPaths.ContainsKey($resolvedFg) -and 
-                                       $appRAMCache.AppPaths[$resolvedFg].ContainsKey('LearnedFiles') -and 
-                                       $appRAMCache.AppPaths[$resolvedFg].LearnedFiles -and 
-                                       $appRAMCache.AppPaths[$resolvedFg].LearnedFiles.Count -gt 0)
-                        # RAMP-UP: Pierwsze 5 min od MISS → agresywne profilowanie co 10 iteracji (~8s)
-                        # Gry ładują większość DLL/assetów w pierwszych 2-3 minutach
-                        # Po 5 min → stabilny profil, wystarczy co 100 iteracji (~80s)
-                        $profileInterval = 100  # default: znana app
+                    # Profile app modules — co 30 iteracji skanuj RZECZYWISTE moduły foreground app
+                    if ($iteration % 30 -eq 0 -and -not [string]::IsNullOrWhiteSpace($currentForeground)) {
+                        $hasLearned = ($appRAMCache.AppPaths.ContainsKey($currentForeground) -and 
+                                       $appRAMCache.AppPaths[$currentForeground].ContainsKey('LearnedFiles') -and 
+                                       $appRAMCache.AppPaths[$currentForeground].LearnedFiles -and 
+                                       $appRAMCache.AppPaths[$currentForeground].LearnedFiles.Count -gt 0)
                         if (-not $hasLearned) {
-                            $profileInterval = 10  # zupełnie nowa app → co ~8s
-                        } elseif ($appRAMCache.AppPaths.ContainsKey($resolvedFg) -and 
-                                  $appRAMCache.AppPaths[$resolvedFg].ContainsKey('FirstMissTime') -and
-                                  $appRAMCache.AppPaths[$resolvedFg].FirstMissTime) {
-                            $minutesSinceMiss = ([datetime]::Now - [datetime]$appRAMCache.AppPaths[$resolvedFg].FirstMissTime).TotalMinutes
-                            if ($minutesSinceMiss -lt 5) {
-                                $profileInterval = 15  # pierwsze 5 min → co ~12s
-                            }
-                        }
-                        if ($iteration % $profileInterval -eq 0) {
-                            $appRAMCache.ProfileAppModules($resolvedFg)
+                            $appRAMCache.ProfileAppModules($currentForeground)
                         }
                     }
                     # #8: Session detection
@@ -21942,15 +21658,12 @@ $Script:PreviousEnsembleEnabled = $false
                     $appRAMCache.BatchTick() | Out-Null
                     
                     # Periodic save — co 100 iteracji (~3 min) zapisz learned data JEŚLI coś się zmieniło
-                    # + forced save co 300 iteracji (~5 min) — persystencja stats (TotalHits/Misses/Aggressiveness)
                     if ($iteration % 100 -eq 0 -and $iteration -gt 0) {
-                        $forceSave = ($iteration % 300 -eq 0)  # co 300 iter wymuszaj zapis niezależnie od IsDirty
-                        if ($appRAMCache.IsDirty -or $forceSave) {
+                        if ($appRAMCache.IsDirty) {
                             $appRAMCache.SaveState($Script:ConfigDir)
                             $appRAMCache.IsDirty = $false
                             if ($Global:DebugMode) {
-                                $reason = if ($forceSave -and -not $appRAMCache.IsDirty) { "PERIODIC" } else { "DIRTY" }
-                                Add-Log "- RAMCache SAVED ($reason): Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count) → C:\CPUManager\RAMCache.json"
+                                Add-Log "- RAMCache SAVED: Paths=$($appRAMCache.AppPaths.Count) Class=$($appRAMCache.AppClassification.Count) → C:\CPUManager\RAMCache.json"
                             }
                         }
                     }
