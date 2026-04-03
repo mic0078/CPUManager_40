@@ -15877,6 +15877,13 @@ class AppRAMCache {
     # ── NEW: Hardware Profile (wypełniane przez ENGINE po Detect-CPU) ──
     [hashtable] $HW                   # CPU/RAM/Storage info od ENGINE
     
+    # ── NEW: ChildApps mapping — parent → known child processes ──
+    # Klucz: parentAppName → @( "child1", "child2", ... )
+    # Gry: EasyAntiCheat, CrashReporter, renderers
+    # DAW: VST plugins, audio engines
+    # IDE: language servers, debuggers
+    [hashtable] $ChildApps
+    
     # ── NEW: Dirty flag — SaveState only when data changed ──
     [bool] $IsDirty = $false
 
@@ -15929,6 +15936,7 @@ class AppRAMCache {
         $this.NegativeScores = @{}
         $this.CurrentSession = "Mixed"
         $this.NameMap = @{}
+        $this.ChildApps = @{}  # parent → @("child1", "child2", ...)
         $this.HW = @{}  # Wypełniane przez ENGINE po Detect-CPU via SetHardwareProfile
         
         # ═══ SKALOWANIE DO HARDWARE (pkt 1,6,9 instrukcji) ═══
@@ -16403,6 +16411,38 @@ class AppRAMCache {
             })
         }
         
+        # ═══ CASCADE PRELOAD: załaduj znane procesy-dzieci ═══
+        # Gry: anti-cheat, renderer, crash handler
+        # DAW: plugin host, audio engine, MIDI service
+        # IDE: language server, debugger, terminal
+        # Preloadujemy dzieci z niższą confidence (nie blokuj cache)
+        if ($this.ChildApps.ContainsKey($appName)) {
+            $childConf = [Math]::Max(0.3, $confidence * 0.6)  # 60% confidence rodzica
+            $childrenLoaded = 0
+            foreach ($childName in $this.ChildApps[$appName]) {
+                if ($this.CachedApps.ContainsKey($childName)) { continue }  # już w cache
+                if ($this.IsNegativePenalty($childName)) { continue }
+                # Spróbuj DiskCache (szybsze)
+                if ($this.LoadAppFromDiskCache($childName)) {
+                    $childrenLoaded++
+                    continue
+                }
+                # Fallback: PreloadApp z zapisanych ścieżek
+                if ($this.AppPaths.ContainsKey($childName)) {
+                    $childExe = $this.AppPaths[$childName].ExePath
+                    if ($childExe) {
+                        $this.PreloadApp($childName, $childExe, $childConf) | Out-Null
+                        $childrenLoaded++
+                    }
+                }
+                # Limit: max 5 dzieci per parent żeby nie zalać cache
+                if ($childrenLoaded -ge 5) { break }
+            }
+            if ($childrenLoaded -gt 0) {
+                Write-RCLog "CASCADE '$appName': preloaded $childrenLoaded child processes"
+            }
+        }
+        
         return $true
     }
     
@@ -16439,10 +16479,16 @@ class AppRAMCache {
                 # Trzymanie Accessor = strony PINNED w RAM (working set ENGINE)
                 # Gdy app startuje → Windows daje jej TE SAME fizyczne strony = instant
                 # ReadAllBytes tworzyło KOPIĘ w managed heap = podwójna pamięć = marnowanie!
+                # FileShare.ReadWrite|Delete = inne procesy MOGĄ modyfikować/usuwać plik
+                # (updatery, instalatory) — bez blokady!
                 if ($fileSize -lt 500MB) {
+                    $fs = [System.IO.FileStream]::new(
+                        $item.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
                     $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
-                        $item.Path, [System.IO.FileMode]::Open, [NullString]::Value, 0, 
-                        [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+                        $fs, [NullString]::Value, 0,
+                        [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read,
+                        [System.IO.HandleInheritability]::None, $false)
                     $accessor = $mmf.CreateViewAccessor(0, $fileSize, 
                         [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
                     # Touch co 4KB = załaduj stronę do RAM (demand paging)
@@ -16451,7 +16497,7 @@ class AppRAMCache {
                         $dummyByte = $accessor.ReadByte($offset)
                     }
                     $this.CachedApps[$appName].Files.Add(@{ 
-                        Path = $item.Path; MMF = $mmf; Accessor = $accessor
+                        Path = $item.Path; MMF = $mmf; Accessor = $accessor; Stream = $fs
                         SizeBytes = $fileSize; Type = $item.Type 
                     })
                 }
@@ -16973,9 +17019,25 @@ class AppRAMCache {
         
         $touchedApps = 0
         $touchedMB = 0
+        $staleApps = [System.Collections.Generic.List[string]]::new()
         foreach ($appName in @($this.CachedApps.Keys)) {
             $entry = $this.CachedApps[$appName]
             if (-not $entry.Files -or $entry.Files.Count -eq 0) { continue }
+            
+            # Staleness check: jeśli plik zmieniony/usunięty od cachowania → evict
+            $isStale = $false
+            foreach ($f in $entry.Files) {
+                try {
+                    if ($f.Path -and (Test-Path $f.Path)) {
+                        $lwt = (Get-Item $f.Path -ErrorAction Stop).LastWriteTime
+                        if ($lwt -gt $entry.CachedAt) { $isStale = $true; break }
+                    } elseif ($f.Path) {
+                        # Plik usunięty (np. updater zastąpił) → stale
+                        $isStale = $true; break
+                    }
+                } catch { continue }
+            }
+            if ($isStale) { $staleApps.Add($appName); continue }
             
             foreach ($f in $entry.Files) {
                 try {
@@ -16991,6 +17053,12 @@ class AppRAMCache {
             }
             $touchedApps++
             $touchedMB += $entry.SizeMB
+        }
+        
+        # Evict stale apps (pliki zmienione przez updater/instalator)
+        foreach ($stale in $staleApps) {
+            Write-RCLog "STALE EVICT '$stale' — pliki zmienione od cachowania, zwalnianie"
+            $this.EvictApp($stale)
         }
         
         if ($touchedApps -gt 0) {
@@ -17368,6 +17436,8 @@ class AppRAMCache {
     # ═══════════════════════════════════════════════════════════════
     [void] ProfileAppModules([string]$appName) {
         if ([string]::IsNullOrWhiteSpace($appName)) { return }
+        # Skip known non-process pseudo-names (Desktop, Shell, etc.)
+        if ($appName -in @('Desktop','ShellExperienceHost','ShellHost','TextInputHost','StartMenuExperienceHost')) { return }
         try {
             $proc = Get-Process -Name $appName -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $proc) { 
@@ -17500,6 +17570,35 @@ class AppRAMCache {
                         # Ignoruj systemowe i engine'owe procesy-dzieci
                         if ($childName -match '^(pwsh|powershell|conhost|svchost|csrss|dwm|WerFault|CrashReportClient|wermgr|rundll32|cmd|msiexec)$') { continue }
                         
+                        # ─── CHILD EXE: dodaj EXE dziecka do LearnedFiles rodzica ───
+                        # Gry uruchamiają anti-cheat, renderery, crashreportery
+                        # DAW-y uruchamiają plugin hosty, audio engine
+                        # Te EXE muszą być w cache żeby start był instant
+                        try {
+                            if ($childProc.Path -and -not $knownPaths.Contains($childProc.Path)) {
+                                $childExeSize = (Get-Item $childProc.Path -ErrorAction Stop).Length
+                                if ($childExeSize -gt 10KB -and $childExeSize -lt 200MB) {
+                                    $learnedFiles.Add(@{
+                                        Path   = $childProc.Path
+                                        Size   = $childExeSize
+                                        Module = "childexe:$childName"
+                                    })
+                                    [void]$knownPaths.Add($childProc.Path)
+                                    $childNewModCount++
+                                }
+                            }
+                        } catch {}
+                        
+                        # ─── CHILD→PARENT MAPPING: zapamiętaj relację ───
+                        if (-not $this.ChildApps.ContainsKey($appName)) {
+                            $this.ChildApps[$appName] = [System.Collections.Generic.List[string]]::new()
+                        }
+                        $childList = $this.ChildApps[$appName]
+                        if ($childList -notcontains $childName) {
+                            $childList.Add($childName)
+                            $this.IsDirty = $true
+                        }
+                        
                         $childModules = @()
                         try { $childModules = $childProc.Modules | Where-Object {
                             $_.FileName -and (Test-Path $_.FileName -ErrorAction SilentlyContinue)
@@ -17521,6 +17620,24 @@ class AppRAMCache {
                                 }
                             } catch { continue }
                         }
+                        
+                        # 1b. Skanuj katalog EXE dziecka — łapie pluginy, assety, DLL
+                        # DAW plugin hosty mają VSTi w swoim katalogu
+                        try {
+                            $childDir = [System.IO.Path]::GetDirectoryName($childProc.Path)
+                            $parentDir = [System.IO.Path]::GetDirectoryName($proc.Path)
+                            if ($childDir -and $childDir -ne $parentDir) {
+                                $childDirFiles = Get-ChildItem -Path $childDir -Include "*.dll","*.vst3","*.clap","*.so","*.dat","*.bin","*.pak" `
+                                    -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 10KB -and $_.Length -lt 100MB } |
+                                    Sort-Object Length -Descending | Select-Object -First 20
+                                foreach ($cdf in $childDirFiles) {
+                                    if ($knownPaths.Contains($cdf.FullName)) { continue }
+                                    $learnedFiles.Add(@{ Path = $cdf.FullName; Size = $cdf.Length; Module = "childdir:$childName" })
+                                    [void]$knownPaths.Add($cdf.FullName)
+                                    $childNewModCount++
+                                }
+                            }
+                        } catch {}
                         
                         # 2. Utwórz/aktualizuj własny AppPaths dziecka (oddzielny klucz)
                         if ($childModules.Count -ge 2) {
@@ -17617,27 +17734,9 @@ class AppRAMCache {
                 }
             } catch {}
             
-            # Zapisz manifest — zawsze po profilu (merge może dodać brakujące pliki z LearnedFiles
-            # których nie było w CachedApps i odwrotnie; zapis idempotentny jeśli nic się nie zmieniło)
-            if ($learnedFiles.Count -gt 0 -or ($this.CachedApps.ContainsKey($appName) -and $this.CachedApps[$appName].Files.Count -gt 0)) {
-                if ($newModCount -gt 0 -or $assetCount -gt 0 -or $childNewModCount -gt 0) {
-                    $this.SaveAppToDiskCache($appName)
-                } elseif ($this.AppPaths.ContainsKey($appName) -and $this.AppPaths[$appName].ContainsKey('LearnedFiles')) {
-                    # Sprawdź czy manifest na dysku jest starszy/uboższy niż LearnedFiles
-                    $diskPath = Join-Path $this.DiskCacheDir "$appName.json"
-                    $diskCount = 0
-                    if (Test-Path $diskPath -ErrorAction SilentlyContinue) {
-                        try {
-                            $diskJson = [System.IO.File]::ReadAllText($diskPath, [System.Text.Encoding]::UTF8)
-                            $diskObj  = $diskJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-                            if ($diskObj -and $diskObj.Files) { $diskCount = $diskObj.Files.Count }
-                        } catch {}
-                    }
-                    $totalKnown = $learnedFiles.Count + $(if ($this.CachedApps.ContainsKey($appName)) { $this.CachedApps[$appName].Files.Count } else { 0 })
-                    if ($totalKnown -gt $diskCount) {
-                        $this.SaveAppToDiskCache($appName)
-                    }
-                }
+            # Zapisz manifest — TYLKO gdy profil się faktycznie zmienił
+            if ($newModCount -gt 0 -or $assetCount -gt 0 -or $childNewModCount -gt 0) {
+                $this.SaveAppToDiskCache($appName)
             }
         } catch {
             Write-RCLog "PROFILE ERROR '$appName': $($_.Exception.Message)"
@@ -17742,6 +17841,28 @@ class AppRAMCache {
                 if ($existingData.TotalHits -and [int]$existingData.TotalHits -gt $this.TotalHits) { $this.TotalHits = [int]$existingData.TotalHits }
                 if ($existingData.TotalMisses -and [int]$existingData.TotalMisses -gt $this.TotalMisses) { $this.TotalMisses = [int]$existingData.TotalMisses }
                 if ($existingData.TotalPreloads -and [int]$existingData.TotalPreloads -gt $this.TotalPreloads) { $this.TotalPreloads = [int]$existingData.TotalPreloads }
+                # Merge ChildApps (parent→children mapping)
+                if ($existingData.ChildApps) {
+                    $existingData.ChildApps.PSObject.Properties | ForEach-Object {
+                        $parentName = $_.Name
+                        if (-not $this.ChildApps.ContainsKey($parentName)) {
+                            $childList = [System.Collections.Generic.List[string]]::new()
+                            foreach ($c in $_.Value) { $childList.Add([string]$c) }
+                            if ($childList.Count -gt 0) {
+                                $this.ChildApps[$parentName] = $childList
+                                $merged++
+                            }
+                        } else {
+                            # Merge: dodaj nieznane dzieci z dysku
+                            foreach ($c in $_.Value) {
+                                if ($this.ChildApps[$parentName] -notcontains [string]$c) {
+                                    $this.ChildApps[$parentName].Add([string]$c)
+                                    $merged++
+                                }
+                            }
+                        }
+                    }
+                }
                 if ($merged -gt 0 -or $enriched -gt 0) { Write-RCLog "MERGE: Restored $merged entries, enriched $enriched apps from disk" }
             }
             
@@ -17796,12 +17917,24 @@ class AppRAMCache {
                 } catch { continue }
             }
             
+            # ChildApps: parent → @("child1", "child2") — safe serialization
+            $childAppsData = @{}
+            foreach ($parent in @($this.ChildApps.Keys)) {
+                try {
+                    $children = @($this.ChildApps[$parent])
+                    if ($children.Count -gt 0) {
+                        $childAppsData[$parent] = $children
+                    }
+                } catch { continue }
+            }
+            
             $data = @{
                 V = 2
                 AppClassification = $this.AppClassification
                 NegativeScores = $negScores
                 AppPaths = $paths
                 NameMap = $this.NameMap
+                ChildApps = $childAppsData
                 Aggressiveness = [Math]::Round($this.Aggressiveness, 3)
                 MaxCacheMB = [int]$this.MaxCacheMB
                 TotalSystemRAM = [int]$this.TotalSystemRAM
@@ -17828,7 +17961,7 @@ class AppRAMCache {
             Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
             Write-RCLog "SAVED: $path ($([Math]::Round($json.Length/1KB,1))KB) Paths=$($paths.Count) Hits=$($this.TotalHits) Miss=$($this.TotalMisses) Aggr=$([Math]::Round($this.Aggressiveness,2))"
             
-            # Batch save manifestów dla WSZYSTKICH znanych apps
+            # Batch save manifestów — TYLKO dla nowych lub oznaczonych jako dirty
             if ($this.DiskCacheDir) {
                 $manifestCount = 0
                 foreach ($app in @($this.AppPaths.Keys)) {
@@ -17838,25 +17971,9 @@ class AppRAMCache {
                         $needsSave = $true
                     } elseif ($this.DirtyManifests.Contains($app)) {
                         $needsSave = $true
-                    } else {
-                        # Sprawdź czy manifest na dysku jest uboższy niż dane w pamięci
-                        # (manifest mógł być zapisany za wcześnie — tylko exe, bez LearnedFiles)
-                        $memFileCount = 0
-                        if ($this.AppPaths[$app].ContainsKey('LearnedFiles') -and $this.AppPaths[$app].LearnedFiles) {
-                            $memFileCount += $this.AppPaths[$app].LearnedFiles.Count
-                        }
-                        if ($this.CachedApps.ContainsKey($app) -and $this.CachedApps[$app].Files) {
-                            $memFileCount += $this.CachedApps[$app].Files.Count
-                        }
-                        if ($memFileCount -gt 1) {
-                            try {
-                                $diskJson = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)
-                                $diskObj = $diskJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-                                $diskFileCount = if ($diskObj -and $diskObj.Files) { $diskObj.Files.Count } else { 0 }
-                                if ($memFileCount -gt $diskFileCount) { $needsSave = $true }
-                            } catch { $needsSave = $true }
-                        }
                     }
+                    # NIE porównuj memFileCount vs diskFileCount — suma LearnedFiles+CachedApps
+                    # jest zawyżona przez nakładanie się źródeł, co powoduje fałszywe zapisy
                     if ($needsSave) {
                         $this.SaveAppToDiskCache($app)
                         $manifestCount++
@@ -17947,6 +18064,18 @@ class AppRAMCache {
                     $this.NameMap[$_.Name] = [string]$_.Value
                 }
             }
+            # Restore ChildApps mapping (parent → children)
+            if ($data.ChildApps) {
+                $data.ChildApps.PSObject.Properties | ForEach-Object {
+                    $parentName = $_.Name
+                    $childList = [System.Collections.Generic.List[string]]::new()
+                    foreach ($c in $_.Value) { $childList.Add([string]$c) }
+                    if ($childList.Count -gt 0) {
+                        $this.ChildApps[$parentName] = $childList
+                    }
+                }
+                Write-RCLog "LOAD: Restored ChildApps for $($this.ChildApps.Count) parent process(es)"
+            }
             # MaxCacheMB NIE przywracaj z JSON — jest dynamicznie wyliczane w konstruktorze
             if ($data.TotalHits) { $this.TotalHits = [int]$data.TotalHits }
             if ($data.TotalMisses) { $this.TotalMisses = [int]$data.TotalMisses }
@@ -18026,8 +18155,39 @@ class AppRAMCache {
                     }
                     $this.AppClassification[$appName] = $class
                     
+                    # 4. Skanuj procesy-dzieci → buduj ChildApps mapping + dodaj child EXE do profilu
+                    try {
+                        $bsChildProcs = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" `
+                            -ErrorAction SilentlyContinue |
+                            Where-Object { $_.ProcessId -ne $proc.Id -and $_.Name -notmatch '\.(tmp)$' }
+                        foreach ($bsChild in $bsChildProcs) {
+                            try {
+                                $bsChildProc = Get-Process -Id $bsChild.ProcessId -ErrorAction SilentlyContinue
+                                if (-not $bsChildProc -or -not $bsChildProc.Path) { continue }
+                                $bsChildName = $bsChildProc.ProcessName
+                                if ($bsChildName -match '^(pwsh|powershell|conhost|svchost|csrss|dwm|WerFault|CrashReportClient|wermgr|rundll32|cmd|msiexec)$') { continue }
+                                # Dodaj do ChildApps mapping
+                                if (-not $this.ChildApps.ContainsKey($appName)) {
+                                    $this.ChildApps[$appName] = [System.Collections.Generic.List[string]]::new()
+                                }
+                                if ($this.ChildApps[$appName] -notcontains $bsChildName) {
+                                    $this.ChildApps[$appName].Add($bsChildName)
+                                }
+                                # Zapisz ścieżkę dziecka (jeśli nowy)
+                                if (-not $this.AppPaths.ContainsKey($bsChildName)) {
+                                    $this.AppPaths[$bsChildName] = @{
+                                        ExePath   = $bsChildProc.Path
+                                        Dir       = [System.IO.Path]::GetDirectoryName($bsChildProc.Path)
+                                        ParentApp = $appName
+                                    }
+                                }
+                            } catch { continue }
+                        }
+                    } catch {}
+                    
                     $learned++
-                    Write-RCLog "  BOOTSTRAP NEW: $appName [$class] modules=$($this.AppPaths[$appName].ModuleCount) exe=$($proc.Path)"
+                    $childCount = if ($this.ChildApps.ContainsKey($appName)) { $this.ChildApps[$appName].Count } else { 0 }
+                    Write-RCLog "  BOOTSTRAP NEW: $appName [$class] modules=$($this.AppPaths[$appName].ModuleCount) children=$childCount exe=$($proc.Path)"
                 } catch { continue }
             }
         } catch {}
@@ -18100,8 +18260,18 @@ class AppRAMCache {
         foreach ($entry in $sorted) {
             $appName = $entry.Name
             # PRIORYTET: DiskCache (instant — pliki lokalne, sekwencyjne)
-            if ($this.LoadAppFromDiskCache($appName)) { continue }
-            # FALLBACK: PreloadApp z oryginalnych ścieżek (wolniejsze)
+            if ($this.LoadAppFromDiskCache($appName)) {
+                # CASCADE: załaduj też znane dzieci z DiskCache
+                if ($this.ChildApps.ContainsKey($appName)) {
+                    foreach ($childApp in $this.ChildApps[$appName]) {
+                        if (-not $this.CachedApps.ContainsKey($childApp)) {
+                            $this.LoadAppFromDiskCache($childApp) | Out-Null
+                        }
+                    }
+                }
+                continue
+            }
+            # FALLBACK: PreloadApp z oryginalnych ścieżek (wolniejsze) — cascade wbudowany
             $exePath = $this.AppPaths[$appName].ExePath
             $conf = [Math]::Min(1.0, $entry.Value / 60.0)
             $this.PreloadApp($appName, $exePath, $conf) | Out-Null
@@ -20508,6 +20678,21 @@ $Script:PreviousEnsembleEnabled = $false
                                     $appRAMCache.AppPaths[$resolved] = @{ ExePath = ''; Dir = '' }
                                 }
                                 $appRAMCache.AppPaths[$resolved].FirstMissTime = [datetime]::Now
+                                
+                                # CASCADE: załaduj znane procesy-dzieci (anti-cheat, plugin host, renderer)
+                                # PreloadApp robi to automatycznie, ale DiskCache/MISS path tego nie robił
+                                if ($appRAMCache.ChildApps.ContainsKey($resolved)) {
+                                    $childrenCached = 0
+                                    foreach ($childApp in $appRAMCache.ChildApps[$resolved]) {
+                                        if ($appRAMCache.CachedApps.ContainsKey($childApp)) { continue }
+                                        if ($appRAMCache.LoadAppFromDiskCache($childApp)) { $childrenCached++ }
+                                        elseif ($appRAMCache.AppPaths.ContainsKey($childApp) -and $appRAMCache.AppPaths[$childApp].ExePath) {
+                                            $appRAMCache.PreloadApp($childApp, $appRAMCache.AppPaths[$childApp].ExePath, 0.7) | Out-Null
+                                            $childrenCached++
+                                        }
+                                        if ($childrenCached -ge 5) { break }
+                                    }
+                                }
                             }
                         }
                     }
