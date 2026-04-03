@@ -2980,7 +2980,7 @@ $Script:LastConfigCheck = [DateTime]::Now
 # AI ENGINES CONFIG - Wlaczone/wylaczone silniki AI
 $Script:AIEnginesPath = Join-Path $Script:ConfigDir "AIEngines.json"
 $Script:LastAIEnginesCheck = [DateTime]::Now
-$Script:AIEnginesCheckInterval = 10  #  PERFORMANCE: Zmieniono z 3s na 10s (wystarczajaco czesto)
+$Script:AIEnginesCheckInterval = 5   # RESPONSIVENESS: Ocena AI co 5s (bylo 10s)
 $Script:DefaultAIEngines = @{
     # CORE - zawsze ON (zalecane)
     QLearning = $true
@@ -3794,6 +3794,9 @@ function Load-ExternalConfig {
             if ($null -ne $configJson.AIThresholds.BalancedThreshold) {
                 $Script:BalancedThreshold = [int]$configJson.AIThresholds.BalancedThreshold
             }
+            if ($null -ne $configJson.AIThresholds.ModeHoldTime) {
+                $Script:ModeMinHoldTime = [int]$configJson.AIThresholds.ModeHoldTime
+            }
         }
         # IOSettings - Ustawienia czulosci I/O (NOWE!)
         if ($configJson.IOSettings) {
@@ -4286,22 +4289,23 @@ function Check-ConfigReload {
 
 # Domyslne wartosci dla parametrow (przed zaladowaniem config.json)
 $Script:ForceModeFromConfig = ""
-$Script:AppLaunchCPUDelta = 12
-$Script:AppLaunchCPUThreshold = 22
+$Script:AppLaunchCPUDelta = 10
+$Script:AppLaunchCPUThreshold = 18
 $Script:DefaultTimerInterval = 1000
 $Script:MinTimerInterval = 400
 $Script:MaxTimerInterval = 2500
 $Script:GamingTimerInterval = 500
-$Script:ForceSilentCPU = 30   # v40.3: Podwyższone z 20 — CPU <30% = ZAWSZE Silent (mniej przełączania, ciszej)
-$Script:ForceSilentCPUInactive = 25
-$Script:TurboThreshold = 72
-$Script:BalancedThreshold = 38
-$Script:BoostCooldown = 20  #  NEW: Domyslny cooldown miedzy Boostami (sekundy)
+$Script:ForceSilentCPU = 20   # RESPONSIVENESS: CPU <20% = Silent (bylo <30%)
+$Script:ForceSilentCPUInactive = 20
+$Script:TurboThreshold = 65
+$Script:BalancedThreshold = 32
+$Script:BoostCooldown = 10  # RESPONSIVENESS: Szybszy cooldown miedzy Boostami (bylo 20s)
+$Script:ModeMinHoldTime = 7  # RESPONSIVENESS: Debounce 7s (bylo 15s hardcoded)
 # === I/O SENSITIVITY SETTINGS (z config.json) ===
 $Script:IOReadThreshold = 80      # MB/s - prog odczytu wyzwalajacy reakcje
 $Script:IOWriteThreshold = 50     # MB/s - prog zapisu wyzwalajacy reakcje  
 $Script:IOSensitivity = 4         # 1-10 skala czulosci (1=niska, 10=bardzo wysoka)
-$Script:IOCheckInterval = 1200    # ms - interwal sprawdzania aktywnosci I/O
+$Script:IOCheckInterval = 500     # ms - RESPONSIVENESS: sprawdzaj co 500ms (bylo 1200ms)
 $Script:IOTurboThreshold = 150    # MB/s - prog I/O dla wymuszenia Turbo
 $Script:IOOverrideForceMode = $false  # Czy I/O moze nadpisac ForceMode
 $Script:LastIOCheck = [DateTime]::Now
@@ -7255,6 +7259,7 @@ class ProcessWatcher {
     [double] $PeakIO
     [object] $BoostProcess
     [System.Collections.Generic.Dictionary[string, datetime]] $RecentBoosts
+    [hashtable] $PendingAppPids = @{}  # PID → [datetime] first-seen — procesy bez okna, retry do 10s
     [int] $BoostCooldownSeconds = 15  #  FIXED: Zmniejszony cooldown z 30s do 15s (konfigurowalny)
     ProcessWatcher([int]$cooldownSeconds = 15) {
         $this.KnownProcessIds = [System.Collections.Generic.HashSet[int]]::new()
@@ -7283,6 +7288,17 @@ class ProcessWatcher {
             }
         }
         foreach ($key in $toRemove) { $this.RecentBoosts.Remove($key) }
+        # Wyczyść stale PendingAppPids (TTL 10s)
+        $pendingRemove = @()
+        foreach ($entry in $this.PendingAppPids.GetEnumerator()) {
+            if (([datetime]::UtcNow - $entry.Value).TotalSeconds -gt 15) {
+                $pendingRemove += $entry.Key
+            }
+        }
+        foreach ($pid in $pendingRemove) { 
+            [void]$this.KnownProcessIds.Add($pid)
+            [void]$this.PendingAppPids.Remove($pid) 
+        }
     }
     [bool] IsOnCooldown([string]$processName) {
         if ($this.RecentBoosts.ContainsKey($processName)) {
@@ -7299,18 +7315,18 @@ class ProcessWatcher {
                 try {
                     if ($this.KnownProcessIds.Contains($process.Id)) { continue }
                     $processName = $process.ProcessName
-                    # Dodaj do known NATYCHMIAST - zapobiega wielokrotnemu przetwarzaniu
-                    [void]$this.KnownProcessIds.Add($process.Id)
                     if ($Global:DebugMode) { Add-Log "NEW PID $($process.Id): $processName" -Debug }
                     # #
                     # FILTROWANIE PROCESOW SYSTEMOWYCH I MALO WAZNYCH
+                    # Dla definitywnych odrzuceń: dodaj PID do known natychmiast
+                    # Dla kandydatów na apki: dodaj dopiero po IsLikelyApp (retry bez okna)
                     # #
                     # 1. Filtruj procesy z innej sesji (systemowe)
-                    if ($process.SessionId -ne $this.SessionId -and $process.SessionId -ne 0) { continue }
+                    if ($process.SessionId -ne $this.SessionId -and $process.SessionId -ne 0) { [void]$this.KnownProcessIds.Add($process.Id); continue }
                     # 2. Sprawdz blackliste
-                    if ($blacklist.Contains($processName)) { continue }
+                    if ($blacklist.Contains($processName)) { [void]$this.KnownProcessIds.Add($process.Id); continue }
                     # 3. Sprawdz cooldown
-                    if ($this.IsOnCooldown($processName)) { continue }
+                    if ($this.IsOnCooldown($processName)) { [void]$this.KnownProcessIds.Add($process.Id); continue }
                     # 4. NOWE: Ignoruj procesy z typowymi nazwami systemowymi/pomocniczymi
                     $systemPatterns = @(
                         "^svc",          # svchost, svcs, etc.
@@ -7342,7 +7358,7 @@ class ProcessWatcher {
                     foreach ($pattern in $systemPatterns) {
                         if ($processName -match $pattern) { $isSystemPattern = $true; break }
                     }
-                    if ($isSystemPattern) { continue }
+                    if ($isSystemPattern) { [void]$this.KnownProcessIds.Add($process.Id); continue }
                     # 5. NOWE: Ignoruj procesy z lokalizacji systemowych
                     try {
                         $processPath = $process.MainModule.FileName
@@ -7359,7 +7375,7 @@ class ProcessWatcher {
                             foreach ($sysPath in $systemPaths) {
                                 if ($processPath -like "*$sysPath*") { $isSystemPath = $true; break }
                             }
-                            if ($isSystemPath) { continue }
+                            if ($isSystemPath) { [void]$this.KnownProcessIds.Add($process.Id); continue }
                         }
                     } catch { }
                     # #
@@ -7368,8 +7384,8 @@ class ProcessWatcher {
                     # Sprawdz czy to prawdziwa aplikacja
                     $isLikelyApp = $false
                     $windowTitle = ""
-                    # 1. Znana jako HEAVY w Prophet
-                    if ($prophet.IsKnownHeavy($processName)) { 
+                    # 1. Znana w Prophet (dowolna — nie tylko Heavy)
+                    if ($prophet.Apps.ContainsKey($processName)) { 
                         $isLikelyApp = $true 
                     }
                     # 2. Ma okno
@@ -7392,7 +7408,22 @@ class ProcessWatcher {
                             }
                         } catch { }
                     }
-                    if (-not $isLikelyApp) { continue }
+                    if (-not $isLikelyApp) {
+                        # Proces bez okna/path — retry do 10s (apka może jeszcze otworzyć okno)
+                        if (-not $this.PendingAppPids.ContainsKey($process.Id)) {
+                            $this.PendingAppPids[$process.Id] = [datetime]::UtcNow
+                        } elseif (([datetime]::UtcNow - $this.PendingAppPids[$process.Id]).TotalSeconds -gt 10) {
+                            # Timeout — permanentnie pomijaj
+                            [void]$this.KnownProcessIds.Add($process.Id)
+                            [void]$this.PendingAppPids.Remove($process.Id)
+                        }
+                        continue
+                    }
+                    # Passed IsLikelyApp — dodaj do known i wyczyść pending
+                    [void]$this.KnownProcessIds.Add($process.Id)
+                    if ($this.PendingAppPids.ContainsKey($process.Id)) {
+                        [void]$this.PendingAppPids.Remove($process.Id)
+                    }
                     # Jesli juz boostujemy inny proces - nie startuj nowego
                     if ($this.IsBoosting) { continue }
                     
@@ -12702,7 +12733,7 @@ class AICoordinator {
         $baseWeights = @{
             "QLearning" = 2.0; "Prophet" = 1.8; "Context" = 1.5; "Thermal" = 1.5
             "Phase" = 1.6; "GPU" = 1.3; "Energy" = 1.2; "Trend" = 1.2
-            "IOMonitor" = 1.0; "NetworkAI" = 0.8; "Pattern" = 1.0; "Brain" = 1.0
+            "IOMonitor" = 1.8; "NetworkAI" = 0.8; "Pattern" = 1.0; "Brain" = 1.0
             "Chain" = 0.8; "Predictor" = 0.7
             "Anomaly" = 0.8; "Activity" = 0.6; "PowerBoost" = 0.5
             "AppIntel" = 2.5
@@ -21825,10 +21856,10 @@ $Script:PreviousEnsembleEnabled = $false
                         $newMode = "Silent"
                         $reason = "THERMAL: $([int]$currentMetrics.Temp)C"
                     }
-                    # SAFETY OVERRIDE 2: HEAVY I/O BURST (>300MB/s + CPU>60%) — nie blokuj dysków
-                    elseif ($ioTotal -gt 300 -and $currentMetrics.CPU -gt 60) {
+                    # SAFETY OVERRIDE 2: I/O BURST — konfigurowalny próg IOTurboThreshold
+                    elseif ($ioTotal -gt $Script:IOTurboThreshold) {
                         $newMode = "Turbo"
-                        $reason = "HEAVY I/O: $([int]$ioTotal)MB CPU=$([int]$currentMetrics.CPU)%"
+                        $reason = "I/O BURST: $([int]$ioTotal)MB/s > $($Script:IOTurboThreshold) (CPU=$([int]$currentMetrics.CPU)%)"
                     }
                     # AI COORDINATOR — pełna inteligencja 18 silników
                     else {
@@ -21866,13 +21897,13 @@ $Script:PreviousEnsembleEnabled = $false
                 if (-not $Script:ModeHoldCandidate) { $Script:ModeHoldCandidate = $null }
                 
                 $modeHoldSeconds = ([DateTime]::UtcNow - $Script:ModeHoldStart).TotalSeconds
-                $modeMinHoldTime = 15  # Minimum sekund w trybie zanim zmiana
+                $modeMinHoldTime = if ($Script:ModeMinHoldTime -gt 0) { $Script:ModeMinHoldTime } else { 7 }
                 
                 if ($newMode -ne $prevMode) {
                     # Wyjątki - natychmiastowa zmiana (bez debounce):
-                    $instantChange = ($reason -match "^THERMAL|^HARDLOCK|^GAMING") -or
-                                     ($newMode -eq "Silent" -and $prevMode -eq "Turbo" -and $currentMetrics.CPU -lt 15) -or
-                                     ($newMode -eq "Turbo" -and $currentMetrics.CPU -gt 85)
+                    $instantChange = ($reason -match "^THERMAL|^HARDLOCK|^GAMING|^I/O BURST") -or
+                                     ($newMode -eq "Silent" -and $prevMode -eq "Turbo" -and $currentMetrics.CPU -lt 20) -or
+                                     ($newMode -eq "Turbo" -and $currentMetrics.CPU -gt 75)
                     
                     if ($instantChange) {
                         # Krytyczne - zmień natychmiast

@@ -676,25 +676,25 @@ $Script:DefaultConfig = @{
     }
     #  SYNC v40: AIThresholds - zsynchronizowane z ENGINE (poprawki efektywności energetycznej)
     AIThresholds = @{
-        TurboThreshold = 80           # CPU% powyzej ktorego wlacza Turbo
-        BalancedThreshold = 40        # CPU% powyzej ktorego wlacza Balanced
-        ForceSilentCPU = 20           # CPU% ponizej ktorego wymusza Silent
-        ForceSilentCPUInactive = 20   # CPU% dla nieaktywnego uzytkownika
-        ModeHoldTime = 10             # Sekundy minimalnego czasu w trybie - debounce
+        TurboThreshold = 65           # RESPONSIVENESS: CPU% powyzej ktorego wlacza Turbo (bylo 72)
+        BalancedThreshold = 32        # RESPONSIVENESS: CPU% powyzej ktorego wlacza Balanced (bylo 38)
+        ForceSilentCPU = 20           # RESPONSIVENESS: CPU% ponizej ktorego wymusza Silent (bylo 30)
+        ForceSilentCPUInactive = 20   # CPU% dla nieaktywnego uzytkownika (bylo 25)
+        ModeHoldTime = 7              # RESPONSIVENESS: Debounce 7s (bylo 10)
     }
     BoostSettings = @{
-        BoostDuration = 3500
-        BoostCooldown = 20
-        AppLaunchSensitivity = @{ CPUDelta = 12; CPUThreshold = 22 }
+        BoostDuration = 8000
+        BoostCooldown = 10
+        AppLaunchSensitivity = @{ CPUDelta = 10; CPUThreshold = 18 }
         AutoBoostEnabled = $true
         AutoBoostSampleMs = 350
         EnableBoostForAllAppsOnStart = $true
         StartupBoostDurationSeconds = 3
     }
     IOSettings = @{
-        ReadThreshold = 30; WriteThreshold = 20; Sensitivity = 10   # AI-first: szybka reakcja I/O
-        CheckInterval = 1200; TurboThreshold = 50
-        OverrideForceMode = $true; ExtremeGraceSeconds = 8
+        ReadThreshold = 80; WriteThreshold = 50; Sensitivity = 4   # I/O defaults
+        CheckInterval = 500; TurboThreshold = 150
+        OverrideForceMode = $false; ExtremeGraceSeconds = 8
     }
     OptimizationSettings = @{
         PreloadEnabled = $true
@@ -4633,8 +4633,8 @@ $gbPower.Controls.Add($Script:cmbForceMode)
 
 # Boost Settings
 $gbBoost = New-GroupBox -Parent $tabSettings -Title "Boost Settings" -X 10 -Y 200 -Width 550 -Height 150
-$boostDur = if ($Script:Config.BoostSettings.BoostDuration) { $Script:Config.BoostSettings.BoostDuration } else { 3500 }
-$boostCool = if ($Script:Config.BoostSettings.BoostCooldown) { $Script:Config.BoostSettings.BoostCooldown } else { 20 }
+$boostDur = if ($Script:Config.BoostSettings.BoostDuration) { $Script:Config.BoostSettings.BoostDuration } else { 8000 }
+$boostCool = if ($Script:Config.BoostSettings.BoostCooldown) { $Script:Config.BoostSettings.BoostCooldown } else { 10 }
 $null = New-Label -Parent $gbBoost -Text "Duration (ms):" -X 15 -Y 28 -Width 120 -Height 22
 $Script:numBoostDuration = New-NumericUpDown -Parent $gbBoost -X 140 -Y 25 -Min 1000 -Max 30000 -Value $boostDur -Width 100 -Increment 500
 $null = New-Label -Parent $gbBoost -Text "Cooldown (s):" -X 260 -Y 28 -Width 110 -Height 22
@@ -4683,11 +4683,11 @@ $toolTip.SetToolTip($Script:chkEnergy, " Tracker efektywnosci energetycznej. Opt
 #  SYNC v43: AI THRESHOLDS - zsynchronizowane z ENGINE
 # #
 $gbAIThresholds = New-GroupBox -Parent $tabSettings -Title " AI Decision Thresholds (SYNC)" -X 10 -Y 680 -Width 550 -Height 120
-$aiTurboThr = if ($Script:Config.AIThresholds.TurboThreshold) { $Script:Config.AIThresholds.TurboThreshold } else { 72 }
-$aiBalancedThr = if ($Script:Config.AIThresholds.BalancedThreshold) { $Script:Config.AIThresholds.BalancedThreshold } else { 38 }
+$aiTurboThr = if ($Script:Config.AIThresholds.TurboThreshold) { $Script:Config.AIThresholds.TurboThreshold } else { 65 }
+$aiBalancedThr = if ($Script:Config.AIThresholds.BalancedThreshold) { $Script:Config.AIThresholds.BalancedThreshold } else { 32 }
 $aiForceSilent = if ($Script:Config.AIThresholds.ForceSilentCPU) { $Script:Config.AIThresholds.ForceSilentCPU } else { 20 }
-$aiForceSilentInact = if ($Script:Config.AIThresholds.ForceSilentCPUInactive) { $Script:Config.AIThresholds.ForceSilentCPUInactive } else { 25 }
-$aiModeHoldTime = if ($Script:Config.AIThresholds.ModeHoldTime) { $Script:Config.AIThresholds.ModeHoldTime } else { 6 }
+$aiForceSilentInact = if ($Script:Config.AIThresholds.ForceSilentCPUInactive) { $Script:Config.AIThresholds.ForceSilentCPUInactive } else { 20 }
+$aiModeHoldTime = if ($Script:Config.AIThresholds.ModeHoldTime) { $Script:Config.AIThresholds.ModeHoldTime } else { 7 }
 New-Label -Parent $gbAIThresholds -Text "Turbo CPU%:" -X 15 -Y 28 -Width 90 -Height 22
 $Script:numAITurboThr = New-NumericUpDown -Parent $gbAIThresholds -X 110 -Y 25 -Min 50 -Max 95 -Value $aiTurboThr -Width 60
 New-Label -Parent $gbAIThresholds -Text "Balanced CPU%:" -X 190 -Y 28 -Width 100 -Height 22
@@ -4698,11 +4698,11 @@ New-Label -Parent $gbAIThresholds -Text "Silent Inactive%:" -X 190 -Y 65 -Width 
 $Script:numAIForceSilentInact = New-NumericUpDown -Parent $gbAIThresholds -X 295 -Y 62 -Min 5 -Max 45 -Value $aiForceSilentInact -Width 60
 New-Label -Parent $gbAIThresholds -Text "Hold Time (s):" -X 380 -Y 65 -Width 90 -Height 22
 $Script:numAIModeHoldTime = New-NumericUpDown -Parent $gbAIThresholds -X 470 -Y 62 -Min 2 -Max 30 -Value $aiModeHoldTime -Width 60
-$toolTip.SetToolTip($Script:numAITurboThr, " CPU% powyzej ktorego AI wlacza TURBO (domyslnie 72%)")
-$toolTip.SetToolTip($Script:numAIBalancedThr, " CPU% powyzej ktorego AI wlacza BALANCED (domyslnie 38%)")
+$toolTip.SetToolTip($Script:numAITurboThr, " CPU% powyzej ktorego AI wlacza TURBO (domyslnie 65%)")
+$toolTip.SetToolTip($Script:numAIBalancedThr, " CPU% powyzej ktorego AI wlacza BALANCED (domyslnie 32%)")
 $toolTip.SetToolTip($Script:numAIForceSilent, " CPU% ponizej ktorego AI wymusza SILENT (domyslnie 20%)")
-$toolTip.SetToolTip($Script:numAIForceSilentInact, " CPU% dla nieaktywnego uzytkownika (domyslnie 25%)")
-$toolTip.SetToolTip($Script:numAIModeHoldTime, "Czas (s) przez jaki AI trzyma tryb przed zmiana - krocej = szybsza reakcja, dluzej = stabilniejszy (domyslnie 6s)")
+$toolTip.SetToolTip($Script:numAIForceSilentInact, " CPU% dla nieaktywnego uzytkownika (domyslnie 20%)")
+$toolTip.SetToolTip($Script:numAIModeHoldTime, "Czas (s) przez jaki AI trzyma tryb przed zmiana - krocej = szybsza reakcja, dluzej = stabilniejszy (domyslnie 7s)")
 New-Label -Parent $gbAIThresholds -Text "Te progi kontroluja decyzje AI o zmianie trybow" -X 15 -Y 95 -Width 500 -Height 15 -ForeColor $Script:Colors.TextDim
 $btnSaveEngines = New-Button -Parent $tabSettings -Text "SAVE AI ENGINES" -X 10 -Y 810 -Width 180 -Height 40 -BackColor $Script:Colors.Success -ForeColor $Script:Colors.Background -OnClick {
 $toolTip.SetToolTip($btnSaveEngines, "✓ Zapisuje konfiguracje systemów AI. Zmiany zastosowane natychmiast.")
@@ -4844,6 +4844,11 @@ $null = New-Label -Parent $gbIO -Text "Turbo IO:" -X 220 -Y 65 -Width 100 -Heigh
 $Script:numIOTurbo = New-NumericUpDown -Parent $gbIO -X 325 -Y 62 -Min 1 -Max 800 -Value $ioTurbo -Width 80 -Increment 10
 $ioOverride = if ($null -ne $Script:Config.IOSettings.OverrideForceMode) { $Script:Config.IOSettings.OverrideForceMode } else { $false }
 $Script:chkIOOverride = New-CheckBox -Parent $gbIO -Text "I/O can override ForceMode" -X 15 -Y 100 -Checked $ioOverride -Width 300
+$toolTip.SetToolTip($Script:numIORead,       " Próg odczytu dysku (MB/s) wyzwalający reakcję I/O Boost. Domyślnie: 80 MB/s.")
+$toolTip.SetToolTip($Script:numIOWrite,      " Próg zapisu dysku (MB/s) wyzwalający reakcję I/O Boost. Domyślnie: 50 MB/s.")
+$toolTip.SetToolTip($Script:numIOSensitivity," Czułość I/O (1=mała, 10=duża). Wyższa = niższe efektywne progi. Domyślnie: 4.")
+$toolTip.SetToolTip($Script:numIOTurbo,      " TURBO I/O: Całkowity ruch dysku (Read+Write MB/s) wymuszający natychmiastowy tryb Turbo.`nDomyślnie: 150 MB/s. Dotyczy też Safety Override (pomija AI debounce).")
+$toolTip.SetToolTip($Script:chkIOOverride,   " Gdy włączone: wysoki ruch I/O (powyżej Turbo IO) może nadpisać ForceMode ustawiony ręcznie.")
 
 # === ULTRA NETWORK SETTINGS ===
 $gbNetworkUltra = New-GroupBox -Parent $tabSettings -Title "ULTRA Network Settings (Maximum Speed)" -X 580 -Y 300 -Width 530 -Height 195
@@ -5165,7 +5170,7 @@ $btnResetSettings = New-Button -Parent $tabSettings -Text "⟲ Reset to Defaults
         $Script:PowerControlsIntel[$mode].Max.Value = $Script:DefaultConfig.PowerModesIntel.$mode.Max
     }
     # Boost Settings
-    $Script:numBoostDuration.Value = 10000; $Script:numBoostCooldown.Value = 20
+    $Script:numBoostDuration.Value = 8000; $Script:numBoostCooldown.Value = 10
     $Script:chkAutoBoost.Checked = $true; $Script:chkStartupBoost.Checked = $true
     $Script:chkActivityBoost.Checked = $true
     $Script:numActivityIdleThreshold.Value = 5; $Script:numActivityMaxBoost.Value = 30
@@ -5179,9 +5184,10 @@ $btnResetSettings = New-Button -Parent $tabSettings -Text "⟲ Reset to Defaults
     $Script:chkSmartPreload.Checked = $true; $Script:chkMemoryCompression.Checked = $false
     $Script:chkPowerBoost.Checked = $false; $Script:chkPredictiveIO.Checked = $true
     $Script:trackCPUAggro.Value = 50; $Script:trackMemoryAggro.Value = 30; $Script:trackIOPriority.Value = 3
-    # AI Decision Thresholds - POPRAWIONE WARTOŚCI DOMYŚLNE
-    $Script:numAITurboThr.Value = 72; $Script:numAIBalancedThr.Value = 38
-    $Script:numAIForceSilent.Value = 20; $Script:numAIForceSilentInact.Value = 25
+    # AI Decision Thresholds - RESPONSIVENESS
+    $Script:numAITurboThr.Value = 65; $Script:numAIBalancedThr.Value = 32
+    $Script:numAIForceSilent.Value = 20; $Script:numAIForceSilentInact.Value = 20
+    $Script:numAIModeHoldTime.Value = 7
     # AI Engines - CORE enabled
     $Script:chkProphet.Checked = $true; $Script:chkSelfTuner.Checked = $true
     $Script:chkAnomalyDetector.Checked = $true; $Script:chkChainPredictor.Checked = $true
