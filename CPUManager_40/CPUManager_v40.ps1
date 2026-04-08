@@ -2814,13 +2814,13 @@ function Get-DefaultConfigTemplate {
     return @{
         ForceMode = ""
         PowerModes = @{
-            Silent   = @{ Min = 50;  Max = 85  }
+            Silent   = @{ Min = 5;   Max = 50  }
             Balanced = @{ Min = 70;  Max = 99  }
             Turbo    = @{ Min = 85;  Max = 100 }
             Extreme  = @{ Min = 100; Max = 100 }
         }
         PowerModesIntel = @{
-            Silent   = @{ Min = 50;  Max = 85  }
+            Silent   = @{ Min = 5;   Max = 50  }
             Balanced = @{ Min = 85;  Max = 99  }
             Turbo    = @{ Min = 99;  Max = 100 }
             Extreme  = @{ Min = 100; Max = 100 }
@@ -3626,11 +3626,11 @@ function Load-ExternalConfig {
         if (-not $configJson.PowerModes) {
             Add-Log "CONFIG MIGRATION: Old config.json detected - adding PowerModes defaults"
             $configJson | Add-Member -NotePropertyName "PowerModes" -NotePropertyValue @{
-                Silent = @{ Min = 50; Max = 85 }; Balanced = @{ Min = 70; Max = 99 }
+                Silent = @{ Min = 5; Max = 50 }; Balanced = @{ Min = 70; Max = 99 }
                 Turbo = @{ Min = 85; Max = 100 }; Extreme = @{ Min = 100; Max = 100 }
             } -Force
             $configJson | Add-Member -NotePropertyName "PowerModesIntel" -NotePropertyValue @{
-                Silent = @{ Min = 50; Max = 85 }; Balanced = @{ Min = 85; Max = 99 }
+                Silent = @{ Min = 5; Max = 50 }; Balanced = @{ Min = 85; Max = 99 }
                 Turbo = @{ Min = 99; Max = 100 }; Extreme = @{ Min = 100; Max = 100 }
             } -Force
             if (-not $configJson.PSObject.Properties.Name.Contains("AIThresholds")) {
@@ -4300,7 +4300,7 @@ $Script:ForceSilentCPUInactive = 20
 $Script:TurboThreshold = 65
 $Script:BalancedThreshold = 32
 $Script:BoostCooldown = 10  # RESPONSIVENESS: Szybszy cooldown miedzy Boostami (bylo 20s)
-$Script:ModeMinHoldTime = 7  # RESPONSIVENESS: Debounce 7s (bylo 15s hardcoded)
+$Script:ModeMinHoldTime = 5  # RESPONSIVENESS: Debounce 5s (bylo 7s, zmieniono dla zgodnosci z Optimized)
 # === I/O SENSITIVITY SETTINGS (z config.json) ===
 $Script:IOReadThreshold = 80      # MB/s - prog odczytu wyzwalajacy reakcje
 $Script:IOWriteThreshold = 50     # MB/s - prog zapisu wyzwalajacy reakcje  
@@ -4581,13 +4581,13 @@ $Script:BlacklistSet = [System.Collections.Generic.HashSet[string]]::new(
 )
 # === STANY MOCY DLA PROCESOROW ===
 $Script:RyzenStates = @{
-    Silent   = @{ Min=50;   Max=85  }   # AMD: Cichy tryb (responsywny, wentylator cicho)
+    Silent   = @{ Min=5;    Max=50  }   # AMD: Cichy tryb — 5% min pozwala CPU spaść do ~200-480MHz przy bezczynności (FIX: było Min=50=2GHz!)
     Balanced = @{ Min=70;   Max=99  }   # AMD: Praca biurowa, kodowanie (stabilne Balanced)
     Turbo    = @{ Min=85;   Max=100 }   # AMD: Gaming, kompilacja (agresywny Turbo)
     Extreme  = @{ Min=100;  Max=100 }   # AMD: Benchmark, rendering (pelna moc)
 }
 $Script:IntelStates = @{
-    Silent   = @{ Min=50;   Max=50  }   # Intel: Cichy tryb — 50%=1.3GHz bazowa, NIE pozwalaj na skoki wyżej
+    Silent   = @{ Min=5;   Max=50  }   # Intel: Cichy tryb — 5%=niskie taktowanie bazowe, NIE pozwalaj na skoki wyżej
     Balanced = @{ Min=50;   Max=99  }   # Intel: Praca biurowa — od bazy do prawie max, Windows sam reguluje
     Turbo    = @{ Min=99;   Max=100 }   # Intel: Gaming, kompilacja (pelna moc)
     Extreme  = @{ Min=100;  Max=100 }   # Intel: Benchmark, rendering (max staly)
@@ -6257,9 +6257,9 @@ class SystemGovernor {
             }
             # Restore when calm
             if (-not $this.IsOverloaded -and $mode -ne "Silent" -and $this.ActiveOverrides.Count -gt 0) {
-                foreach ($pid in @($this.ActiveOverrides.Keys)) {
-                    try { $p = Get-Process -Id $pid -ErrorAction SilentlyContinue; if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal; $p.Dispose() } } catch {}
-                    $this.ActiveOverrides.Remove($pid)
+                foreach ($pId_ in @($this.ActiveOverrides.Keys)) {
+                    try { $p = Get-Process -Id $pId_ -ErrorAction SilentlyContinue; if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal; $p.Dispose() } } catch {}
+                    $this.ActiveOverrides.Remove($pId_)
                 }
             }
         } catch {}
@@ -6378,8 +6378,8 @@ class SystemGovernor {
                 powercfg /setacvalueindex $g $s "5d76a2ca-e8c0-402f-a133-2158492d58ad" 0 2>$null
                 powercfg /setactive $g 2>$null
             }
-            foreach ($pid in @($this.ActiveOverrides.Keys)) {
-                try { $p = Get-Process -Id $pid -ErrorAction SilentlyContinue; if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal; $p.Dispose() } } catch {}
+            foreach ($pId_ in @($this.ActiveOverrides.Keys)) {
+                try { $p = Get-Process -Id $pId_ -ErrorAction SilentlyContinue; if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal; $p.Dispose() } } catch {}
             }
             $this.ActiveOverrides.Clear()
         } catch {}
@@ -6458,10 +6458,10 @@ class GPUBoundDetector {
         
         # v42.5: PROGI z HYSTERESIS
         # ENTRY: CPU < 50% AND GPU > 75% (łatwiejszy wejście)
-        # EXIT: CPU > 60% AND GPU < 65% (oba muszą być spełnione - zapobiega fałszywym exitom)
+        # EXIT: CPU > 50% AND GPU < 65% (oba muszą być spełnione - zapobiega fałszywym exitom)
         # v43.14 FIX: OR→AND - CPU spike SAM nie powinien powodować EXIT (GPU nadal pracuje!)
         $entryCondition = ($cpu -lt 50 -and $gpuLoad -gt 75)
-        $exitCondition = ($cpu -gt 60 -and $gpuLoad -lt 65)
+        $exitCondition = ($cpu -gt 50 -and $gpuLoad -lt 65)
         
         # v43.12: Cooldown po EXIT - nie wracaj natychmiast
         $cooldownActive = $false
@@ -7295,9 +7295,9 @@ class ProcessWatcher {
                 $pendingRemove += $entry.Key
             }
         }
-        foreach ($pid in $pendingRemove) { 
-            [void]$this.KnownProcessIds.Add($pid)
-            [void]$this.PendingAppPids.Remove($pid) 
+        foreach ($pId_ in $pendingRemove) { 
+            [void]$this.KnownProcessIds.Add($pId_)
+            [void]$this.PendingAppPids.Remove($pId_) 
         }
     }
     [bool] IsOnCooldown([string]$processName) {
@@ -19102,16 +19102,43 @@ function Set-PowerMode {
     param(
         [string]$Mode,
         [int]$CurrentCPU = 50,
+        [int]$CurrentGPU = 0,
         [switch]$HardLock
     )
     if ([string]::IsNullOrWhiteSpace($Mode)) { return }
+    
+    # Get power states
+    $powerStates = Get-PowerStates
+    $state = $powerStates[$Mode]
+    if (-not $state) { return }
+    
+    $minValue = $state.Min
+    $maxValue = $state.Max
+    
+    # Dynamic Silent mode adjustment for smoother frequency management
+    if ($Mode -eq "Silent") {
+        $range = $state.Max - $state.Min
+        $load = [Math]::Max($CurrentCPU, $CurrentGPU)
+        if ($load -lt 8) { $maxValue = $state.Min + [Math]::Round($range * 0.15) }
+        elseif ($load -lt 20) { $maxValue = $state.Min + [Math]::Round($range * 0.4) }
+        elseif ($load -lt 35) { $maxValue = $state.Min + [Math]::Round($range * 0.7) }
+        $maxValue = [Math]::Max($minValue, [Math]::Min($state.Max, $maxValue))
+    }
+    
+    # Skip if no change
+    if ($Script:LastPowerMode -eq $Mode -and $Script:LastPowerMax -eq $maxValue) { return }
+    
+    # Minimum time between mode changes for stability
+    if (-not $Script:LastModeChangeTime) { $Script:LastModeChangeTime = [DateTime]::MinValue }
+    $timeSinceLastChange = ([DateTime]::Now - $Script:LastModeChangeTime).TotalSeconds
+    $minInterval = if ($Script:MinModeChangeInterval) { $Script:MinModeChangeInterval } else { 5 }
+    if ($timeSinceLastChange -lt $minInterval -and -not $HardLock) { return }
+    
     # ═══ AMD: RyzenADJ (bezpośredni TDP) ═══
     if ($Script:RyzenAdjAvailable -and $Script:CPUType -eq "AMD") {
         Set-RyzenAdjMode $Mode | Out-Null
         # AMD nadal potrzebuje powercfg jako backup (affinity zarządzane przez RyzenAdj)
-        $powerStates = Get-PowerStates
-        $state = $powerStates[$Mode]
-        if ($state -and ($Script:LastPowerMode -ne $Mode -or $Script:LastPowerMax -ne $state.Max)) {
+        if ($state -and ($Script:LastPowerMode -ne $Mode -or $Script:LastPowerMax -ne $maxValue)) {
             try {
                 if (-not $Script:PowerPlanGUID) {
                     $output = powercfg /getactivescheme 2>$null
@@ -19122,10 +19149,10 @@ function Set-PowerMode {
                 if ($Script:PowerPlanGUID) {
                     $guid = $Script:PowerPlanGUID
                     $subgroup = "54533251-82be-4824-96c1-47b60b740d00"
-                    powercfg /setacvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $state.Min 2>$null
-                    powercfg /setacvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $state.Max 2>$null
-                    powercfg /setdcvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $state.Min 2>$null
-                    powercfg /setdcvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $state.Max 2>$null
+                    powercfg /setacvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $minValue 2>$null
+                    powercfg /setacvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $maxValue 2>$null
+                    powercfg /setdcvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $minValue 2>$null
+                    powercfg /setdcvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $maxValue 2>$null
                     powercfg /setactive $guid 2>$null
                 }
             } catch {}
@@ -19137,9 +19164,7 @@ function Set-PowerMode {
     }
     # ═══ FALLBACK: nieznany CPU — powercfg jako ostatnia deska ═══
     elseif ($Script:CPUType -ne "AMD") {
-        $powerStates = Get-PowerStates
-        $state = $powerStates[$Mode]
-        if ($state -and ($Script:LastPowerMode -ne $Mode -or $Script:LastPowerMax -ne $state.Max)) {
+        if ($state -and ($Script:LastPowerMode -ne $Mode -or $Script:LastPowerMax -ne $maxValue)) {
             try {
                 if (-not $Script:PowerPlanGUID) {
                     $output = powercfg /getactivescheme 2>$null
@@ -19150,10 +19175,10 @@ function Set-PowerMode {
                 if ($Script:PowerPlanGUID) {
                     $guid = $Script:PowerPlanGUID
                     $subgroup = "54533251-82be-4824-96c1-47b60b740d00"
-                    powercfg /setacvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $state.Min 2>$null
-                    powercfg /setacvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $state.Max 2>$null
-                    powercfg /setdcvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $state.Min 2>$null
-                    powercfg /setdcvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $state.Max 2>$null
+                    powercfg /setacvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $minValue 2>$null
+                    powercfg /setacvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $maxValue 2>$null
+                    powercfg /setdcvalueindex $guid $subgroup "893dee8e-2bef-41e0-89c6-b55d0929964c" $minValue 2>$null
+                    powercfg /setdcvalueindex $guid $subgroup "bc5038f7-23e0-4960-96da-33abaf5935ec" $maxValue 2>$null
                     powercfg /setactive $guid 2>$null
                 }
             } catch {}
@@ -19165,12 +19190,13 @@ function Set-PowerMode {
             $method = if ($Script:CPUType -eq "AMD") { "RyzenAdj" } 
                       elseif ($Script:CPUType -eq "Intel" -and $Script:IntelPM) { "IntelPM" } 
                       else { "powercfg" }
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] MODE: $($Script:LastPowerMode) -> $Mode [$method] CPU:$CurrentCPU%" -ForegroundColor Gray
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] MODE: $($Script:LastPowerMode) -> $Mode [$method] CPU:$CurrentCPU% GPU:$CurrentGPU%" -ForegroundColor Gray
         }
         $Global:LastLoggedMode = $Mode
         $Global:ModeChangeCount++
         $Script:LastPowerMode = $Mode
-        $Script:LastPowerMax = 0
+        $Script:LastPowerMax = $maxValue
+        $Script:LastModeChangeTime = [DateTime]::Now
     }
 }
 # FILE OPERATIONS - FIXED z obsluga bledow
@@ -19488,7 +19514,71 @@ function Show-Database {
 }
 
 # MAIN EXECUTION - FIXED z garbage collection i cleanup
+function Test-CPUManagerRunning {
+    try {
+        $currentPid = $PID
+        $cpuManagerProcesses = Get-Process -Name "powershell", "pwsh" -ErrorAction SilentlyContinue | 
+            Where-Object { 
+                $_.Id -ne $currentPid -and 
+                $_.MainWindowTitle -match "CPU.*Manager|CPUManager" 
+            }
+        
+        if ($cpuManagerProcesses) {
+            Write-Host "  [WARN] CPUManager już działa (PID: $($cpuManagerProcesses.Id -join ', '))" -ForegroundColor Red
+            Write-Host "  [INFO] Zamykanie tej instancji, aby uniknąć konfliktów..." -ForegroundColor Yellow
+            return $true
+        }
+        
+        # Dodatkowe sprawdzenie przez pliki lock
+        $lockFile = Join-Path $Script:ConfigDir "CPUManager.lock"
+        if (Test-Path $lockFile) {
+            try {
+                $lockContent = Get-Content $lockFile -Raw -ErrorAction SilentlyContinue
+                if ($lockContent) {
+                    $lockData = $lockContent | ConvertFrom-Json
+                    $lockPid = $lockData.PID
+                    $lockTime = [DateTime]::Parse($lockData.Timestamp)
+                    
+                    # Sprawdź czy proces nadal istnieje
+                    $processExists = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
+                    if ($processExists -and ((Get-Date) - $lockTime).TotalMinutes -lt 30) {
+                        Write-Host "  [WARN] CPUManager już działa (lock file: PID $lockPid)" -ForegroundColor Red
+                        Write-Host "  [INFO] Zamykanie tej instancji, aby uniknąć konfliktów..." -ForegroundColor Yellow
+                        return $true
+                    } else {
+                        # Stary lock file, usuń go
+                        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch {
+                # Problem z lock file, usuń go
+                Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+        
+        # Utwórz nowy lock file
+        $lockData = @{
+            PID = $currentPid
+            Timestamp = (Get-Date).ToString('o')
+            ProcessName = "CPUManager_v40"
+        }
+        $lockJson = $lockData | ConvertTo-Json -Compress
+        Set-Content -Path $lockFile -Value $lockJson -Encoding UTF8 -ErrorAction SilentlyContinue
+        
+        return $false
+    } catch {
+        Write-Host "  [WARN] Błąd podczas sprawdzania instancji: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
 function Main {
+    # SPRAWDŹ CZY JUŻ DZIAŁA INSTANCJA
+    if (Test-CPUManagerRunning) {
+        Start-Sleep -Seconds 2
+        exit
+    }
+    
     Clear-Host
     Write-Host "`n  #" -ForegroundColor Cyan
     Write-Host "    CPU Manager v40 - STARTING" -ForegroundColor Yellow
@@ -20756,7 +20846,7 @@ $Script:PreviousEnsembleEnabled = $false
                     SafeWarm $preemptiveResult.App
                     # Jeśli AI aktywne, włącz Turbo preemptively
                     if ($Global:AI_Active -and $currentState -ne "Turbo") {
-                        Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU
+                        Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
                         Add-Log "- PREEMPT: $($preemptiveResult.Reason)"
                     }
                 }
@@ -20857,7 +20947,7 @@ $Script:PreviousEnsembleEnabled = $false
             [void]$userPatterns.RecordSample($currentMetrics.CPU, $currentMetrics.Temp, $currentContext, $currentState, $isUserActive)
             # WYMUSZENIE TRYBU SILENT W IDLE
             if ($currentContext -eq "Idle" -and -not $isUserActive -and -not $watcher.IsBoosting) {
-                Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU
+                Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
                 $currentState = "Silent"
                 $aiDecision = @{ Score = 0; Mode = "Silent"; Reason = "Wymuszone Idle"; Trend = 0 }
             }
@@ -20876,7 +20966,7 @@ $Script:PreviousEnsembleEnabled = $false
                     }
                     # Nie podnoś trybu jeśli Idle wymusza Silent
                     if (!($currentContext -eq "Idle" -and -not $isUserActive)) {
-                        Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU
+                        Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
                     }
                 }
             }
@@ -20886,7 +20976,7 @@ $Script:PreviousEnsembleEnabled = $false
                 $newFound = $watcher.ScanAndBoost($Script:BlacklistSet, $prophet, $cpuSpike, $currentMetrics.CPU)
                 if ($newFound) {
                     #  FIXED: BOOST nowej aplikacji = TURBO natychmiast!
-                    Set-PowerMode -Mode "Turbo" -CurrentCPU $currentMetrics.CPU
+                    Set-PowerMode -Mode "Turbo" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
                     $boostSecs = $watcher.GetBoostRemainingSeconds()
                     Add-Log " BOOST: $($watcher.BoostDisplayName) (${boostSecs}s)"
                     [void]$loadPredictor.RecordAppLaunch($watcher.BoostProcessName)
@@ -20907,7 +20997,7 @@ $Script:PreviousEnsembleEnabled = $false
             if ($watcher.IsBoosting) {
                 [void]$watcher.UpdateBoost($currentMetrics.CPU, $currentMetrics.IO)
                 #  FIXED: Utrzymuj TURBO przez caly czas BOOST
-                Set-PowerMode -Mode "Turbo" -CurrentCPU $currentMetrics.CPU
+                Set-PowerMode -Mode "Turbo" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
             }
             if (-not $watcher.IsBoosting -and ![string]::IsNullOrWhiteSpace($watcher.BoostProcessName)) {
                 $learnData = $watcher.FinishBoost()
@@ -21861,6 +21951,12 @@ $Script:PreviousEnsembleEnabled = $false
                         $newMode = "Turbo"
                         $reason = "I/O BURST: $([int]$ioTotal)MB/s > $($Script:IOTurboThreshold) (CPU=$([int]$currentMetrics.CPU)%)"
                     }
+                    # SAFETY OVERRIDE 3: VERY LOW ACTIVITY — Natychmiastowy Silent gdy CPU+GPU prawie zero
+                    # (jak CPUManager_Optimized — hard rule zamiast czekania na konsensus 18 silników)
+                    elseif ($currentMetrics.CPU -lt 10 -and $gpuLoad -lt 15 -and -not $hardLockBlocked) {
+                        $newMode = "Silent"
+                        $reason = "IDLE-LOW: CPU=$([int]$currentMetrics.CPU)% GPU=$([int]$gpuLoad)% (Very Low Activity)"
+                    }
                     # AI COORDINATOR — pełna inteligencja 18 silników
                     else {
                         try {
@@ -21902,8 +21998,8 @@ $Script:PreviousEnsembleEnabled = $false
                 if ($newMode -ne $prevMode) {
                     # Wyjątki - natychmiastowa zmiana (bez debounce):
                     $instantChange = ($reason -match "^THERMAL|^HARDLOCK|^GAMING|^I/O BURST") -or
-                                     ($newMode -eq "Silent" -and $prevMode -eq "Turbo" -and $currentMetrics.CPU -lt 20) -or
-                                     ($newMode -eq "Turbo" -and $currentMetrics.CPU -gt 75)
+                                     ($newMode -eq "Silent" -and $currentMetrics.CPU -lt 20) -or
+                                     ($newMode -eq "Turbo" -and $currentMetrics.CPU -gt 65)
                     
                     if ($instantChange) {
                         # Krytyczne - zmień natychmiast
@@ -21946,10 +22042,10 @@ $Script:PreviousEnsembleEnabled = $false
                 if (-not $Script:LastModeChangeTime) { $Script:LastModeChangeTime = [datetime]::MinValue }
                 if ($newMode -ne $prevMode) {
                     $holdElapsed = ((Get-Date) - $Script:LastModeChangeTime).TotalSeconds
-                    $isSafetyOverride = ($reason -match "THERMAL|HARDLOCK|GPU-BOUND|PAUSED|ForceMode")
-                    if ($holdElapsed -lt 20 -and -not $isSafetyOverride) {
+                    $isSafetyOverride = ($reason -match "THERMAL|HARDLOCK|GPU-BOUND|PAUSED|ForceMode|IDLE-LOW")
+                    if ($holdElapsed -lt 5 -and -not $isSafetyOverride) {
                         $newMode = $prevMode
-                        $reason = "HOLD-MIN-TIME: $([int]$holdElapsed)/20s (blocked: $reason)"
+                        $reason = "HOLD-MIN-TIME: $([int]$holdElapsed)/5s (blocked: $reason)"
                     } else {
                         $Script:LastModeChangeTime = Get-Date
                     }
@@ -21976,10 +22072,10 @@ $Script:PreviousEnsembleEnabled = $false
                     try {
                         $govPM = @{}
                         if ($proBalance -and $proBalance.ProcessCPU.Count -gt 0) {
-                            foreach ($pid in $proBalance.ProcessCPU.Keys) {
-                                $pD = $proBalance.ProcessCPU[$pid]
+                            foreach ($pId_ in $proBalance.ProcessCPU.Keys) {
+                                $pD = $proBalance.ProcessCPU[$pId_]
                                 if ($pD.History.Count -gt 0) {
-                                    $govPM[$pid] = @{ Name = $pD.Name; PID = $pid; CPU = $pD.History[$pD.History.Count - 1] }
+                                    $govPM[$pId_] = @{ Name = $pD.Name; PID = $pId_; CPU = $pD.History[$pD.History.Count - 1] }
                                 }
                             }
                         }
@@ -22039,34 +22135,34 @@ $Script:PreviousEnsembleEnabled = $false
                 $aiSuggestion = $currentState  # Zapisz co AI sugerowalo
                 $currentState = $Script:UserForcedMode
                 $aiDecision.Reason = "User locked: $($Script:UserForcedMode) (AI suggests: $aiSuggestion)"
-                Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU -HardLock:$isHardLocked
+                Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad -HardLock:$isHardLocked
             }
             # 2. SILENT LOCK - calkowita cisza, AI wylaczone
             elseif ($Script:SilentLockMode) {
                 $currentState = "Silent"
                 $aiDecision.Reason = "Silent Lock (enforced)"
-                Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU -HardLock
+                Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad -HardLock
             }
             # 3. BALANCED LOCK - AI wylaczone, zawsze Balanced
             elseif ($Script:BalancedLockMode) {
                 $currentState = "Balanced"
                 $aiDecision.Reason = "Balanced Lock (enforced)"
-                Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU -HardLock
+                Set-PowerMode -Mode "Balanced" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad -HardLock
             }
             # 4. SILENT MODE (legacy) - AI sugeruje ale zostajemy w Silent
             elseif ($Script:SilentModeActive -and $currentState -ne "Silent") {
                 $currentApp = if ($watcher.BoostProcessName) { $watcher.BoostProcessName } else { $currentActiveApp }
                 if ($currentApp -and $Script:UserApprovedBoosts.Contains($currentApp)) {
-                    Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU
+                    Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad
                 } else {
                     $aiDecision.Reason = "AI suggests: $currentState (Silent enforced)"
                     $currentState = "Silent"
-                    Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU -HardLock
+                    Set-PowerMode -Mode "Silent" -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad -HardLock
                 }
             }
             # 5. PELNE AI - AI decyduje o trybie
             else {
-                Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU -HardLock:$hardLockBlocked
+                Set-PowerMode -Mode $currentState -CurrentCPU $currentMetrics.CPU -CurrentGPU $gpuLoad -HardLock:$hardLockBlocked
             }
             # UWAGA: NIE resetuj BalancedLockMode/SilentLockMode tutaj!
             # Te flagi są zarządzane TYLKO przez config reload (linie 3243-3267)
@@ -23702,6 +23798,13 @@ $Script:PreviousEnsembleEnabled = $false
         } catch { }
         try { $metrics.Cleanup() } catch { }
         try { $watcher.Cleanup() } catch { }
+        # Usuń lock file przy zamknięciu
+        try {
+            $lockFile = Join-Path $Script:ConfigDir "CPUManager.lock"
+            if (Test-Path $lockFile) {
+                Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
         # Stop metrics timer if running
         try {
             if ($Script:MetricsTimer) {
